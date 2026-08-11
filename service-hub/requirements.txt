@@ -1,0 +1,5 @@
+fastapi>=0.115,<1
+httpx>=0.28,<1
+psutil>=6.1,<8
+PyYAML>=6.0.2,<7
+uvicorn>=0.34,<1

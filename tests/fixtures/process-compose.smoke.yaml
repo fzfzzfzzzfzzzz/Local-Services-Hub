@@ -1,0 +1,69 @@
+version: "0.5"
+is_strict: true
+
+processes:
+  smoke_python_single:
+    description: "Single-process Python smoke service"
+    command: 'service-hub\.venv\Scripts\python.exe tests\fixtures\sample_server.py --host 127.0.0.1 --port 18760 --name python-single'
+    working_dir: '.'
+    namespace: smoke-python
+    disabled: true
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        scheme: http
+        path: /health
+        port: 18760
+      initial_delay_seconds: 1
+      period_seconds: 1
+      timeout_seconds: 2
+      success_threshold: 1
+      failure_threshold: 3
+
+  smoke_dual_frontend:
+    description: "Frontend half of the dual-process smoke project"
+    command: 'service-hub\.venv\Scripts\python.exe tests\fixtures\sample_server.py --host 127.0.0.1 --port 18761 --name dual-frontend'
+    working_dir: '.'
+    namespace: smoke-dual
+    disabled: true
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        scheme: http
+        path: /health
+        port: 18761
+      initial_delay_seconds: 1
+      period_seconds: 1
+      timeout_seconds: 2
+
+  smoke_dual_backend:
+    description: "Backend half of the dual-process smoke project"
+    command: 'service-hub\.venv\Scripts\python.exe tests\fixtures\sample_server.py --host 127.0.0.1 --port 18762 --name dual-backend'
+    working_dir: '.'
+    namespace: smoke-dual
+    disabled: true
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        scheme: http
+        path: /health
+        port: 18762
+      initial_delay_seconds: 1
+      period_seconds: 1
+      timeout_seconds: 2
+
+  smoke_node:
+    description: "Node.js smoke service"
+    command: 'node tests\fixtures\sample_server.mjs --host 127.0.0.1 --port 18763 --name node-smoke'
+    working_dir: '.'
+    namespace: smoke-node
+    disabled: true
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        scheme: http
+        path: /health
+        port: 18763
+      initial_delay_seconds: 1
+      period_seconds: 1
+      timeout_seconds: 2

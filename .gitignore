@@ -1,0 +1,27 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Personal service data. Public releases only track the matching *.example files.
+/services.json
+/service-groups.json
+/service-inventory.yaml
+/service-registry.yaml
+/process-compose.generated.yaml
+/process-compose.generated.yaml.tmp
+/process-compose.generated.yaml.rollback
+services.json.bak
+service-groups.json.bak
+services.json.tmp
+services.json.corrupt-*
+service-groups.json.tmp
+
+runtime/*
+!runtime/.gitkeep
+logs/*
+!logs/.gitkeep
+
+tools/process-compose/*
+!tools/process-compose/.gitkeep

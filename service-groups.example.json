@@ -1,0 +1,12 @@
+{
+  "groups": [
+    {
+      "id": "grp_example",
+      "name": "Example Group",
+      "description": "Example grouping for the disabled sample service.",
+      "services": [
+        "example_web"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "services": [
+    {
+      "id": "example_web",
+      "name": "Example Web Service",
+      "port": 8800,
+      "working_dir": ".",
+      "command": "python -m http.server 8800 --bind 127.0.0.1",
+      "url": "http://127.0.0.1:8800",
+      "type": "frontend",
+      "note": "Disabled example entry. Replace it with a service on your computer.",
+      "health_url": null,
+      "health_check_type": "tcp",
+      "health_expected_status": 200,
+      "dependencies": [],
+      "runtime_items": [
+        {
+          "id": "main",
+          "port": 8800,
+          "command": "python -m http.server 8800 --bind 127.0.0.1"
+        }
+      ],
+      "enabled": false
+    }
+  ]
+}

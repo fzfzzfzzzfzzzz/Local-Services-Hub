@@ -1,0 +1,23 @@
+version: "0.5"
+is_strict: true
+
+processes:
+  service_hub:
+    description: "Local Service Hub web control plane"
+    command: '.venv\Scripts\python.exe -m uvicorn app:app --host 127.0.0.1 --port 8750'
+    working_dir: '.\service-hub'
+    namespace: system
+    availability:
+      restart: on_failure
+      backoff_seconds: 2
+      max_restarts: 5
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        scheme: http
+        path: /health
+        port: 8750
+      initial_delay_seconds: 1
+      period_seconds: 2
+      timeout_seconds: 2
+      failure_threshold: 5

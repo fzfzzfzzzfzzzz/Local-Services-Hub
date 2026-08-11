@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Local Service Hub — 本地服务登记与控制中心" />
+    <title>Local Service Hub</title>
+    <link rel="stylesheet" href="/static/style.css?v=0.4.6" />
+    <script src="/static/app.js?v=0.4.6" defer></script>
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="Local Service Hub 首页">
+          <span class="brand-mark" aria-hidden="true">LH</span>
+          <span><strong>Local Service Hub</strong><small>登记一次，以后都在这里管理</small></span>
+        </a>
+        <div class="topbar-meta">
+          <span id="last-updated" class="last-updated">等待首次同步</span>
+          <span id="controller-pill" class="controller-pill is-loading">
+            <span class="status-dot"></span><span>正在连接控制器</span>
+          </span>
+        </div>
+      </header>
+
+      <main>
+        <div class="intro">
+          <div>
+            <p class="eyebrow">PERSONAL LOCAL SERVICE REGISTRY · v0.4</p>
+            <h1>你的本地服务，一个入口就够了。</h1>
+            <p id="hero-summary" class="hero-summary">正在读取服务状态…</p>
+          </div>
+          <div class="intro-actions">
+            <button id="new-service" class="button button-primary button-large" type="button">＋ 登记新服务</button>
+            <button id="restart-hub" class="button button-secondary button-large" type="button">重启 Service Hub</button>
+            <button id="shutdown-hub" class="button button-danger-quiet button-large" type="button">退出 Service Hub</button>
+          </div>
+        </div>
+
+        <div id="controller-alert" class="alert alert-danger" hidden>
+          <div><strong id="controller-alert-title">Controller Offline</strong><p id="controller-alert-message"></p></div>
+          <button class="button button-secondary" data-action="retry" type="button">重试</button>
+        </div>
+        <div id="store-alert" class="alert alert-danger" hidden>
+          <div><strong>登记文件需要处理</strong><p id="store-alert-message"></p></div>
+          <button id="restore-backup" class="button button-secondary" type="button">从备份恢复</button>
+        </div>
+
+        <section class="scenes-section" aria-labelledby="scenes-heading">
+          <div class="section-heading section-heading-compact">
+            <div><p class="eyebrow">STARTUP SCENES</p><h2 id="scenes-heading">启动场景</h2></div>
+            <button id="new-group" class="button button-secondary" type="button">＋ 新建服务组</button>
+          </div>
+          <div id="groups-grid" class="groups-grid" aria-live="polite"></div>
+        </section>
+
+        <section class="services-section" aria-labelledby="services-heading">
+          <div class="section-heading">
+            <div><p class="eyebrow">MY REGISTERED SERVICES</p><h2 id="services-heading">我的服务</h2></div>
+            <div class="heading-actions">
+              <span id="service-total" class="service-total">载入中…</span>
+              <button id="refresh-services" class="button button-quiet" type="button">↻ 刷新状态</button>
+            </div>
+          </div>
+          <div class="service-toolbar">
+            <label class="service-search">
+              <span class="sr-only">搜索服务</span>
+              <input id="service-search" type="search" placeholder="搜索服务、端口或项目路径…" autocomplete="off" />
+            </label>
+            <div id="service-filters" class="filter-group" aria-label="筛选服务">
+              <button class="filter-chip is-active" data-filter="all" type="button">全部</button>
+              <button class="filter-chip" data-filter="running" type="button">运行中</button>
+              <button class="filter-chip" data-filter="stopped" type="button">已停止</button>
+              <button class="filter-chip" data-filter="external" type="button">外部运行</button>
+              <button class="filter-chip" data-filter="error" type="button">异常</button>
+            </div>
+            <div id="view-switch" class="view-switch" aria-label="服务视图">
+              <button data-view="cards" type="button">卡片</button>
+              <button data-view="compact" type="button">紧凑</button>
+            </div>
+          </div>
+          <div id="services-grid" class="services-grid" aria-live="polite">
+            <div class="empty-state"><span class="spinner"></span><p>正在读取登记服务…</p></div>
+          </div>
+        </section>
+
+        <section class="ports-section" aria-labelledby="ports-heading">
+          <div class="section-heading">
+            <div><p class="eyebrow">PORT SUGGESTIONS</p><h2 id="ports-heading">推荐空闲端口</h2></div>
+            <button id="refresh-ports" class="button button-quiet" type="button">↻ 重新扫描</button>
+          </div>
+          <div id="ports-grid" class="ports-grid" aria-live="polite">
+            <div class="inline-loading"><span class="spinner"></span>正在扫描 8700–8999…</div>
+          </div>
+          <p class="section-note">端口仅供参考；点击后会预填登记表单，不会修改任何项目代码或配置。</p>
+        </section>
+      </main>
+
+      <footer>
+        <span>Service Hub <strong>:8750</strong></span>
+        <span>Process Compose <strong>:8751</strong></span>
+        <span>配置源 <strong>services.json · service-groups.json</strong></span>
+        <a href="/api/docs" target="_blank" rel="noreferrer">API 文档 ↗</a>
+      </footer>
+    </div>
+
+    <dialog id="service-dialog" class="modal">
+      <form id="service-form" class="modal-shell">
+        <header class="modal-header">
+          <div><p class="eyebrow">REGISTERED SERVICE</p><h2 id="service-dialog-title">登记新服务</h2></div>
+          <button class="icon-button" data-close="service-dialog" type="button" aria-label="关闭">×</button>
+        </header>
+        <div class="form-grid">
+          <label class="field field-wide"><span>服务名称 <em>*</em></span><input name="name" required maxlength="160" placeholder="例如：Example Web Service" /></label>
+          <label class="field"><span>类型</span>
+            <select name="type">
+              <option value="frontend">Frontend</option><option value="backend">Backend</option>
+              <option value="fullstack">Fullstack</option><option value="worker">Worker</option>
+              <option value="plugin">Plugin</option><option value="other" selected>Other</option>
+            </select>
+          </label>
+          <label class="field field-wide"><span>项目目录 <em>*</em></span><input name="working_dir" required placeholder="D:\Projects\my-service" /></label>
+          <fieldset class="field field-wide runtime-field">
+            <legend>运行端口与启动命令 <em>*</em></legend>
+            <div class="runtime-field-heading">
+              <p class="field-help">每个端口对应一条独立启动命令；启动、停止和检测会按顺序处理全部运行项。</p>
+              <button id="add-runtime-item" class="button button-secondary" type="button">＋ 增加端口</button>
+            </div>
+            <div id="runtime-items" class="runtime-items"></div>
+          </fieldset>
+          <label class="field field-wide"><span>打开 URL</span><input name="url" type="url" placeholder="http://127.0.0.1:8790" /></label>
+          <label class="field"><span>健康检查方式</span>
+            <select name="health_check_type">
+              <option value="process">进程存在</option>
+              <option value="tcp" selected>TCP 端口</option>
+              <option value="http">HTTP 请求</option>
+            </select>
+          </label>
+          <label class="field" data-health-http><span>预期 HTTP 状态码</span><input name="health_expected_status" type="number" min="100" max="599" value="200" /></label>
+          <label class="field field-wide" data-health-http><span>Health URL <em>*</em></span><input name="health_url" type="url" placeholder="http://127.0.0.1:8790/health" /></label>
+          <fieldset class="field field-wide dependency-field">
+            <legend>依赖服务</legend>
+            <p class="field-help">启动本服务前，会按顺序启动并等待这些服务健康。</p>
+            <div id="service-dependencies" class="service-checklist"></div>
+          </fieldset>
+          <label class="field field-wide"><span>备注</span><textarea name="note" rows="2" placeholder="这个服务用来做什么？"></textarea></label>
+          <label class="check-field field-wide"><input name="enabled" type="checkbox" checked /><span>启用服务并纳入 Process Compose 运行配置</span></label>
+        </div>
+        <p id="form-error" class="form-error" hidden></p>
+        <div class="modal-actions">
+          <button class="button button-secondary" data-close="service-dialog" type="button">取消</button>
+          <button id="save-service" class="button button-primary" type="submit">保存登记</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="restart-choice-dialog" class="modal modal-small">
+      <div class="modal-shell">
+        <header class="modal-header"><div><p class="eyebrow">RUNNING SERVICE</p><h2>配置何时生效？</h2></div></header>
+        <p class="modal-copy">运行端口、启动命令或项目目录已改变。这些修改需要重启后生效。</p>
+        <div class="choice-actions">
+          <button class="button button-secondary" data-choice="cancel" type="button">取消</button>
+          <button class="button button-quiet" data-choice="defer" type="button">保存但暂不重启</button>
+          <button class="button button-primary" data-choice="restart" type="button">保存并重启</button>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog id="takeover-dialog" class="modal modal-small">
+      <div class="modal-shell">
+        <header class="modal-header">
+          <div><p class="eyebrow">TAKE OVER</p><h2>纳入 Process Compose 管理</h2></div>
+          <button class="icon-button" data-close="takeover-dialog" type="button" aria-label="关闭">×</button>
+        </header>
+        <p class="modal-copy">将停止当前外部实例，然后使用登记的目录和命令重新启动。</p>
+        <dl id="takeover-details" class="detail-list"></dl>
+        <p class="warning-copy">仅会处理上方登记端口对应的 PID。确认前不会停止进程。</p>
+        <div class="modal-actions">
+          <button class="button button-secondary" data-close="takeover-dialog" type="button">取消</button>
+          <button id="confirm-takeover" class="button button-danger" type="button">确认停止并纳管</button>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog id="logs-dialog" class="modal logs-modal">
+      <div class="modal-shell">
+        <header class="modal-header">
+          <div><p class="eyebrow">RECENT OUTPUT</p><h2 id="logs-title">最近日志</h2></div>
+          <button class="icon-button" data-close="logs-dialog" type="button" aria-label="关闭">×</button>
+        </header>
+        <div id="logs-error-summary" class="logs-error-summary" hidden></div>
+        <div class="logs-toolbar">
+          <div class="log-tabs" aria-label="日志轮次">
+            <button class="filter-chip is-active" data-log-view="current" type="button">当前运行</button>
+            <button class="filter-chip" data-log-view="previous" type="button">上一轮运行</button>
+          </div>
+          <span id="logs-counts" class="logs-counts"></span>
+          <button id="refresh-logs" class="button button-secondary" type="button">刷新</button>
+          <button id="copy-logs" class="button button-secondary" type="button">复制日志</button>
+          <button id="clear-logs" class="button button-danger-quiet" type="button">清空当前日志</button>
+        </div>
+        <div id="logs-output" class="logs-output">正在载入…</div>
+      </div>
+    </dialog>
+
+    <dialog id="group-dialog" class="modal modal-small">
+      <form id="group-form" class="modal-shell">
+        <header class="modal-header">
+          <div><p class="eyebrow">SERVICE GROUP</p><h2 id="group-dialog-title">新建服务组</h2></div>
+          <button class="icon-button" data-close="group-dialog" type="button" aria-label="关闭">×</button>
+        </header>
+        <div class="form-grid">
+          <label class="field field-wide"><span>场景名称 <em>*</em></span><input name="name" required maxlength="160" placeholder="例如：AI 创作" /></label>
+          <label class="field field-wide"><span>描述</span><textarea name="description" rows="2" placeholder="这个场景会启动哪些工作环境？"></textarea></label>
+          <fieldset class="field field-wide dependency-field">
+            <legend>包含服务 <em>*</em></legend>
+            <div id="group-services" class="service-checklist"></div>
+          </fieldset>
+        </div>
+        <p id="group-form-error" class="form-error" hidden></p>
+        <div class="modal-actions">
+          <button class="button button-secondary" data-close="group-dialog" type="button">取消</button>
+          <button id="save-group" class="button button-primary" type="submit">保存服务组</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="group-progress-dialog" class="modal modal-small">
+      <div class="modal-shell">
+        <header class="modal-header">
+          <div><p class="eyebrow">STARTUP PROGRESS</p><h2 id="group-progress-title">正在启动场景</h2></div>
+          <button class="icon-button" data-close="group-progress-dialog" type="button" aria-label="关闭">×</button>
+        </header>
+        <div id="group-progress-list" class="group-progress-list"></div>
+        <p id="group-progress-message" class="modal-copy"></p>
+        <div class="modal-actions">
+          <button class="button button-secondary" data-close="group-progress-dialog" type="button">关闭</button>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog id="details-dialog" class="modal details-modal">
+      <div class="modal-shell">
+        <header class="modal-header">
+          <div><p class="eyebrow">SERVICE DETAILS</p><h2 id="details-title">服务详情</h2></div>
+          <button class="icon-button" data-close="details-dialog" type="button" aria-label="关闭">×</button>
+        </header>
+        <div id="details-status" class="details-status"></div>
+        <dl id="details-list" class="detail-list details-list"></dl>
+        <div class="modal-actions">
+          <button id="details-open-logs" class="button button-secondary" type="button">查看日志</button>
+          <button id="details-edit" class="button button-primary" type="button">编辑配置</button>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog id="remove-dialog" class="modal modal-small">
+      <div class="modal-shell">
+        <header class="modal-header">
+          <div><p class="eyebrow">REMOVE REGISTRATION</p><h2 id="remove-title">移除服务登记</h2></div>
+          <button class="icon-button" data-close="remove-dialog" type="button" aria-label="关闭">×</button>
+        </header>
+        <p id="remove-message" class="modal-copy"></p>
+        <p class="remove-safety">这只会从 Service Hub 中移除服务登记，不会删除项目目录、代码或其他文件。</p>
+        <div class="modal-actions">
+          <button class="button button-secondary" data-close="remove-dialog" type="button">取消</button>
+          <button id="confirm-remove" class="button button-danger" type="button">移除登记</button>
+        </div>
+      </div>
+    </dialog>
+
+    <div id="toast-region" class="toast-region" aria-live="polite"></div>
+  </body>
+</html>
