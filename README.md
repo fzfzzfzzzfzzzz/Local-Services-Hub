@@ -5,6 +5,16 @@ Local Service Hub 是面向 Windows 的个人本地服务登记与控制中心�
 - Service Hub：`http://127.0.0.1:8750`
 - Process Compose REST API：`http://127.0.0.1:8751`
 
+## 界面预览
+
+### 服务总览与启动场景
+
+![Local Service Hub 服务总览](docs/images/service-hub-dashboard.png)
+
+### 登记新服务
+
+![Local Service Hub 登记新服务](docs/images/register-service-dialog.png)
+
 ## 代码与本地数据
 
 公开仓库只包含代码和虚构示例。下列文件保存当前电脑上的真实服务信息，已被 Git 忽略：

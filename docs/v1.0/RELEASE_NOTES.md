@@ -2,6 +2,16 @@
 
 Local Service Hub v1.0 是第一个面向公开使用的正式版本，支持在 Windows 上集中登记、查看和控制个人本地服务。
 
+## 界面预览
+
+### 服务总览与启动场景
+
+![Local Service Hub 服务总览](https://github.com/fzfzzfzzzfzzzz/Local-Services-Hub/releases/download/v1.0.0/service-hub-dashboard.png)
+
+### 登记新服务
+
+![Local Service Hub 登记新服务](https://github.com/fzfzzfzzzfzzzz/Local-Services-Hub/releases/download/v1.0.0/register-service-dialog.png)
+
 ## 主要功能
 
 - 登记、编辑、分组和搜索本地服务
