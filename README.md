@@ -1,4 +1,4 @@
-# Local Service Hub v1.0.0
+# Local Service Hub V1.0
 
 Local Service Hub 是面向 Windows 的个人本地服务登记与控制中心。它只展示用户主动登记的服务，并通过 Process Compose 提供启动、停止、重启、状态检测和日志查看能力。
 

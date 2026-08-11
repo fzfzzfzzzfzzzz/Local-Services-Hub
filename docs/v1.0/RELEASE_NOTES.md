@@ -1,6 +1,6 @@
-# Local Service Hub v1.0
+# Local Service Hub V1.0
 
-Local Service Hub v1.0 是第一个面向公开使用的正式版本，支持在 Windows 上集中登记、查看和控制个人本地服务。
+Local Service Hub V1.0 是第一个面向公开使用的正式版本，支持在 Windows 上集中登记、查看和控制个人本地服务。
 
 ## 界面预览
 
