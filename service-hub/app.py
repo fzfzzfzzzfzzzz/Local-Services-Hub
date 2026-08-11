@@ -35,6 +35,7 @@ from services.service_store import (
     ServiceValidationError,
 )
 from services.status_resolver import StatusResolver
+from version import __version__
 
 
 SERVICE_HUB_DIR = Path(__file__).resolve().parent
@@ -156,7 +157,7 @@ def create_app(
 
     app = FastAPI(
         title="Local Service Hub",
-        version="0.4.0",
+        version=__version__,
         docs_url="/api/docs",
         redoc_url=None,
         lifespan=lifespan,
@@ -220,7 +221,7 @@ def create_app(
         return {
             "status": "ok",
             "service": "local-service-hub",
-            "version": "0.4.0",
+            "version": __version__,
             "instance_id": app.state.instance_id,
             "registered_services": len(store.list_services()),
             "store_degraded": store.degraded_error is not None,

@@ -106,7 +106,7 @@ def test_health_and_crud_persist_and_sync_config(tmp_path: Path) -> None:
         deleted = client.delete(f"/api/services/{service_id}")
 
     assert health.status_code == 200
-    assert health.json()["version"] == "0.4.0"
+    assert health.json()["version"] == "1.0.0"
     assert created.status_code == 201
     assert created.json()["service"]["health_check_type"] == "tcp"
     assert created.json()["service"]["health_check"]["type"] == "tcp"
