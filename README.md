@@ -96,7 +96,7 @@ services.json → Service Hub → process-compose.generated.yaml → Process Com
 - 两个控制端口均只监听 `127.0.0.1`。
 - 浏览器只能提交服务字段和 Service ID，没有任意 Shell 或任意 PID Kill API。
 - “纳入管理”会显示目标 PID、进程和命令，确认后才停止该进程。
-- 外部启动的服务默认不能由本工具停止或重启。
+- 外部接入的服务默认不能由本工具停止或重启，并会显示黄色提醒。
 - 配置文件使用临时文件、备份和原子替换；损坏时提供显式恢复。
 - 真实服务路径、命令、分组、日志和 token 不属于公开仓库内容。
 

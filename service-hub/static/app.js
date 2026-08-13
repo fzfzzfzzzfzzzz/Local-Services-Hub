@@ -25,7 +25,7 @@ const state = {
 const statePresentation = {
   Healthy: { symbol: "●", label: "运行中", tone: "running", origin: "本管理器启动" },
   "Managed Running": { symbol: "●", label: "运行中", tone: "running", origin: "本管理器启动" },
-  "External Running": { symbol: "●", label: "运行中", tone: "running", origin: "外部启动" },
+  "External Running": { symbol: "●", label: "运行中", tone: "running", origin: "外部接入", originTone: "external" },
   Starting: { symbol: "◐", label: "启动中", tone: "starting", origin: "本管理器启动" },
   Unhealthy: { symbol: "!", label: "异常", tone: "error", origin: "本管理器启动" },
   Error: { symbol: "!", label: "异常", tone: "error", origin: "本管理器启动" },
@@ -98,7 +98,11 @@ function statusBlock(service, { compact = false } = {}) {
   const badge = element("span", "state-badge", `${presentation.symbol} ${presentation.label}`);
   badge.dataset.tone = presentation.tone;
   line.append(badge);
-  if (presentation.origin) line.append(element("small", "state-origin", presentation.origin));
+  if (presentation.origin) {
+    const origin = element("small", "state-origin", presentation.origin);
+    if (presentation.originTone) origin.dataset.tone = presentation.originTone;
+    line.append(origin);
+  }
   return line;
 }
 
@@ -359,7 +363,7 @@ function renderHeroSummary(services) {
   const external = services.filter((item) => item.state === "External Running").length;
   const stopped = services.filter((item) => ["Stopped", "Disabled"].includes(item.state)).length;
   const issues = services.filter((item) => errorStates.has(item.state)).length;
-  const parts = [`${services.length} 个服务`, `${running} 运行中`, `${external} 外部启动`, `${stopped} 已停止`];
+  const parts = [`${services.length} 个服务`, `${running} 运行中`, `${external} 外部接入`, `${stopped} 已停止`];
   if (issues) parts.push(`${issues} 异常`);
   $("#hero-summary").textContent = parts.join(" · ");
 }

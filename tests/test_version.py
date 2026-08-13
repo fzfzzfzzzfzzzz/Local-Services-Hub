@@ -21,3 +21,15 @@ def test_public_version_markers_match_runtime_version() -> None:
     assert readme.startswith("# Local Service Hub V1.0\n")
     assert "PERSONAL LOCAL SERVICE REGISTRY · V1.0" in index
     assert "__version__" in generated_header_source
+
+
+def test_external_origin_has_a_dedicated_warning_tone() -> None:
+    app_js = (PROJECT_ROOT / "service-hub" / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    style_css = (PROJECT_ROOT / "service-hub" / "static" / "style.css").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'origin: "外部接入", originTone: "external"' in app_js
+    assert '.state-origin[data-tone="external"]' in style_css
