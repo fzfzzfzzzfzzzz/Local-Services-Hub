@@ -83,6 +83,14 @@ class TakeoverInput(BaseModel):
 
     confirm: bool = False
     pid: int | None = Field(default=None, ge=1)
+    pids: list[int] = Field(default_factory=list)
+
+
+class ExternalStopInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm: bool = False
+    pids: list[int] = Field(default_factory=list)
 
 
 class ServiceGroupInput(BaseModel):
@@ -306,7 +314,23 @@ def create_app(
             service_id,
             confirm=payload.confirm,
             pid=payload.pid,
+            pids=payload.pids,
         )
+
+    @app.post("/api/services/{service_id}/stop-external")
+    async def stop_external_service(
+        service_id: str,
+        payload: ExternalStopInput,
+    ) -> dict[str, object]:
+        return await hub.stop_external_service(
+            service_id,
+            confirm=payload.confirm,
+            pids=payload.pids,
+        )
+
+    @app.delete("/api/services/{service_id}/last-run")
+    async def clear_service_last_run(service_id: str) -> dict[str, object]:
+        return await hub.clear_last_run(service_id)
 
     @app.get("/api/services/{service_id}/logs")
     async def service_logs(

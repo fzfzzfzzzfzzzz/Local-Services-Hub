@@ -83,6 +83,10 @@ class HubService:
         self._stop_timeout_seconds = 8.0
         self._hub_shutdown_delay_seconds = 0.6
         self._dependency_timeout_seconds = 25.0
+        self._takeover_previews: dict[
+            str,
+            tuple[tuple[str, int, str, int | None], ...],
+        ] = {}
 
     async def close(self) -> None:
         await self.status_resolver.close()
@@ -214,35 +218,84 @@ class HubService:
     async def snapshot(self) -> dict[str, Any]:
         services = self.store.list_services()
         controller, raw_states = await self._controller_and_states()
+        acknowledged_by_service: dict[str, dict[str, int]] = {}
+        for service in services:
+            primary_process_id = process_id_for(service.id)
+            primary_state = raw_states.get(primary_process_id) or {}
+            last_run = self.run_history.get_last_run(service.id)
+            expected_exit = self.run_history.get_expected_exit(service.id)
+            # Incrementally migrate clean-stop history created before
+            # acknowledged_exits existed. Only the exact residual PID is safe.
+            if (
+                (
+                    isinstance(last_run, dict)
+                    and last_run.get("exit_type") == "normal_stop"
+                    and isinstance(last_run.get("pid"), int)
+                    and last_run.get("pid") == primary_state.get("pid")
+                    or expected_exit in {"stop", "restart"}
+                )
+                and isinstance(primary_state.get("pid"), int)
+                and int(primary_state["pid"]) > 0
+                and not bool(primary_state.get("is_running", False))
+            ):
+                self.run_history.acknowledge_exits(
+                    service.id,
+                    {primary_process_id: int(primary_state["pid"])},
+                )
+            acknowledged_by_service[service.id] = (
+                self.run_history.reconcile_acknowledged_exits(
+                    service.id,
+                    raw_states,
+                )
+            )
         views = await self.status_resolver.resolve_all(
             services,
             raw_states,
             controller_online=bool(controller["online"]),
+            acknowledged_exits_by_service=acknowledged_by_service,
         )
-        external_views = [item for item in views if item["state"] == "External Running"]
-        if external_views:
+        services_by_id = {service.id: service for service in services}
+        external_runtimes = [
+            (view, runtime)
+            for view in views
+            for runtime in view.get("runtime_views", [])
+            if runtime.get("state") == "External Running"
+        ]
+        if external_runtimes:
             inspected = await asyncio.gather(
                 *(
                     asyncio.to_thread(
                         inspect_listening_port,
-                        int(item.get("effective_port") or item["port"]),
+                        int(runtime["port"]),
                     )
-                    for item in external_views
+                    for _, runtime in external_runtimes
                 ),
                 return_exceptions=True,
             )
-            for view, process in zip(external_views, inspected, strict=True):
+            for (view, runtime), process in zip(external_runtimes, inspected, strict=True):
                 if isinstance(process, dict):
-                    view["pid"] = process.get("pid")
-                    view["started_at"] = process.get("started_at")
-                    service = next(
-                        item for item in services if item.id == view["id"]
-                    )
-                    view["port_occupant"] = self._port_conflict(
+                    runtime["pid"] = process.get("pid")
+                    runtime["process"] = process
+                    view.setdefault("external_processes", []).append(process)
+                    service = services_by_id[str(view["id"])]
+                    conflict = self._port_conflict(
                         service,
                         process,
-                        port=int(view.get("effective_port") or service.port),
+                        port=int(runtime["port"]),
                     )
+                    if view.get("port_occupant") is None:
+                        view["port_occupant"] = conflict
+                    if len(view.get("runtime_views", [])) == 1:
+                        view["pid"] = process.get("pid")
+                        view["started_at"] = process.get("started_at")
+        for view in views:
+            view["pids"] = list(
+                dict.fromkeys(
+                    int(runtime["pid"])
+                    for runtime in view.get("runtime_views", [])
+                    if isinstance(runtime.get("pid"), int) and runtime["pid"] > 0
+                )
+            )
         issue_views = [item for item in views if item["state"] in {"Error", "Unhealthy"}]
         issue_logs: list[list[str] | Exception] = []
         if controller["online"] and issue_views:
@@ -267,18 +320,24 @@ class HubService:
             if isinstance(lines, list):
                 diagnostics[str(view["id"])] = classify_logs(lines)
 
-        services_by_id = {service.id: service for service in services}
         views_by_id = {str(view["id"]): view for view in views}
         for view in views:
             service_id = str(view["id"])
             diagnosis = diagnostics.get(service_id, {})
-            last_error = diagnosis.get("last_error") or view.get("error")
+            current_fault = view["state"] in {"Error", "Unhealthy", "Unknown"}
+            last_error = (
+                diagnosis.get("last_error") or view.get("error")
+                if current_fault
+                else None
+            )
             view["last_error"] = last_error
-            raw_state = raw_states.get(process_id_for(service_id)) or {}
+            primary_process_id = process_id_for(service_id)
+            raw_state = raw_states.get(primary_process_id) or {}
             view["last_run"] = await asyncio.to_thread(
                 self.run_history.observe,
                 service_id,
                 raw_state,
+                process_id=primary_process_id,
                 last_error=last_error,
             )
             service = services_by_id[service_id]
@@ -306,7 +365,13 @@ class HubService:
                 "running": counts["Healthy"] + counts["Managed Running"],
                 "starting": counts["Starting"],
                 "external": counts["External Running"],
-                "issues": counts["Unhealthy"] + counts["Error"],
+                "mixed": counts["Mixed Running"],
+                "issues": (
+                    counts["Unhealthy"]
+                    + counts["Error"]
+                    + counts["Unknown"]
+                    + counts["Mixed Running"]
+                ),
                 "stopped": counts["Stopped"],
                 "disabled": counts["Disabled"],
                 "unknown": counts["Unknown"],
@@ -452,6 +517,13 @@ class HubService:
             else service.items()
         )
         process_ids = [process_id_for(service.id, item.id) for item in runtime_items]
+        initial_states = await self.process_compose.list_processes()
+        observed_pids = {
+            process_id: int(raw_state["pid"])
+            for process_id in process_ids
+            if isinstance((raw_state := initial_states.get(process_id) or {}).get("pid"), int)
+            and int(raw_state["pid"]) > 0
+        }
         await asyncio.to_thread(
             self.run_history.mark_expected_exit,
             service.id,
@@ -489,6 +561,30 @@ class HubService:
                 if listening
             ]
             if not process_running and not listening_ports:
+                observed_pids.update(
+                    {
+                        process_id: int(state["pid"])
+                        for process_id, state in zip(process_ids, states, strict=True)
+                        if isinstance(state.get("pid"), int) and int(state["pid"]) > 0
+                    }
+                )
+                await asyncio.to_thread(
+                    self.run_history.observe,
+                    service.id,
+                    states[0] if states else {},
+                    process_id=process_ids[0] if process_ids else service.id,
+                    last_error=None,
+                )
+                await asyncio.to_thread(
+                    self.run_history.acknowledge_exits,
+                    service.id,
+                    observed_pids,
+                )
+                await asyncio.to_thread(
+                    self.run_history.confirm_normal_stop,
+                    service.id,
+                    next(iter(observed_pids.values()), None),
+                )
                 return
             remaining = deadline - loop.time()
             if remaining <= 0:
@@ -531,6 +627,14 @@ class HubService:
                 changed_critical.append("runtime_items")
             was_managed = before_view["state"] in MANAGED_STATES
             disabling = before.enabled and raw.get("enabled") is False
+            if before_view["state"] == "Mixed Running" and (
+                disabling or changed_critical
+            ):
+                raise HubConflict(
+                    "mixed_running_requires_takeover",
+                    "服务存在混合运行项；请先统一纳入管理再修改运行配置",
+                    context={"state": before_view["state"], "can_takeover": True},
+                )
             if disabling and not before_view["controller_online"]:
                 raise ControllerOffline("控制器离线，无法确认服务已停止，因此不能禁用")
             if disabling and before_view["state"] == "External Running":
@@ -576,13 +680,7 @@ class HubService:
                     raise ControllerOffline(
                         f"配置已保存，但控制器离线，无法重启：{warning}"
                     )
-                await self._archive_current_logs(service)
-                await asyncio.to_thread(
-                    self.run_history.mark_expected_exit,
-                    service.id,
-                    "restart",
-                )
-                await self._restart_runtime_processes(service)
+                await self._restart_confirmed(service)
                 service = self.store.set_active_config(service.id, None)
         return {
             "service": await self.get_service_view(service.id),
@@ -596,6 +694,12 @@ class HubService:
             service = self.store.get_service(service_id)
             view = await self.get_service_view(service_id)
             was_external = view["state"] == "External Running"
+            if view["state"] == "Mixed Running":
+                raise HubConflict(
+                    "mixed_running_requires_takeover",
+                    "服务存在混合运行项；请先统一纳入管理再删除",
+                    context={"state": view["state"], "can_takeover": True},
+                )
             if view["state"] in MANAGED_STATES and not stop:
                 raise HubConflict(
                     "stop_required",
@@ -662,6 +766,21 @@ class HubService:
             context={"port_conflict": conflict},
         )
 
+    async def _restart_confirmed(self, service: ServiceDefinition) -> None:
+        """Stop, verify the ports are actually free, then start fresh.
+
+        Restarting straight through the controller binds the new process onto
+        whatever listens on the port now: the old process may already be dead
+        with an unrelated process holding the port, and the health check would
+        be answered by that intruder. Splitting the restart into a confirmed
+        stop, a port check, and a clean start surfaces the conflict instead.
+        """
+        await self._archive_current_logs(service)
+        await self._stop_and_confirm(service)
+        await self._ensure_runtime_ports_free(service)
+        await self._reload_controller()
+        await self._start_runtime_processes(service)
+
     async def _ensure_runtime_ports_free(self, service: ServiceDefinition) -> None:
         for item in service.items():
             if await asyncio.to_thread(is_port_listening, item.port):
@@ -686,32 +805,6 @@ class HubService:
                 str(exc),
             )
             raise
-
-    async def _restart_runtime_processes(self, service: ServiceDefinition) -> None:
-        desired = {item.id: item for item in service.items()}
-        active = {
-            item.id: item
-            for item in (
-                service.active_config.items()
-                if service.active_config is not None
-                else service.items()
-            )
-        }
-        for runtime_id in reversed(list(active)):
-            if runtime_id in desired:
-                continue
-            try:
-                await self.process_compose.stop_process(
-                    process_id_for(service.id, runtime_id)
-                )
-            except ProcessComposeError:
-                pass
-        for runtime_id in desired:
-            process_id = process_id_for(service.id, runtime_id)
-            if runtime_id in active:
-                await self.process_compose.restart_process(process_id)
-            else:
-                await self.process_compose.start_process(process_id)
 
     async def _wait_until_ready(
         self,
@@ -789,6 +882,12 @@ class HubService:
                     results.append({"id": service.id, "name": service.name, "status": "external_running"})
                     continue
                 await self._raise_port_conflict(service)
+            if state == "Mixed Running":
+                raise HubConflict(
+                    "mixed_running_requires_takeover",
+                    f"服务“{service.name}”存在混合运行项；请先统一纳入管理",
+                    context={"failed_service_id": service.id, "can_takeover": True},
+                )
             if state == "Starting":
                 await self._wait_until_ready(service)
                 results.append({"id": service.id, "name": service.name, "status": "running"})
@@ -820,6 +919,12 @@ class HubService:
             raise ControllerOffline("Process Compose Controller Offline")
         if view["state"] in MANAGED_STATES:
             raise HubConflict("already_running", "服务已经由 Process Compose 运行")
+        if view["state"] == "Mixed Running":
+            raise HubConflict(
+                "mixed_running_requires_takeover",
+                "服务存在混合运行项；请先统一纳入管理",
+                context={"state": view["state"], "can_takeover": True},
+            )
         if service.dependencies:
             async with self._mutation_lock:
                 results = await self._start_plan(
@@ -872,20 +977,190 @@ class HubService:
         view = await self.get_service_view(service_id)
         if not view["controller_online"]:
             raise ControllerOffline("Process Compose Controller Offline")
+        if view["state"] in {"External Running", "Mixed Running"}:
+            detail = (
+                "服务已由外部程序重启，请重新纳入管理"
+                if view["state"] == "External Running"
+                else "服务包含外部运行项，请统一纳入管理"
+            )
+            raise HubConflict(
+                "external_running",
+                detail,
+                context={
+                    "state": view["state"],
+                    "can_takeover": True,
+                },
+            )
         if view["state"] not in MANAGED_STATES:
-            raise HubConflict("not_managed", "只有 Managed Running 服务可以重启")
-        await self.process_compose.reload_configuration()
-        self._config_sync_warning = None
-        await self._archive_current_logs(service)
+            raise HubConflict(
+                "not_managed",
+                f"当前状态为 {view['state']}，无法重启",
+                context={"state": view["state"], "can_takeover": False},
+            )
+        await self._restart_confirmed(service)
+        if self.store.get_service(service_id).active_config is not None:
+            self.store.set_active_config(service_id, None)
+        return {"service_id": service_id, "operation": "restart"}
+
+    async def _takeover_runtime_snapshot(
+        self,
+        service: ServiceDefinition,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        controller, raw_states = await self._controller_and_states()
+        if not controller["online"]:
+            raise ControllerOffline("Process Compose Controller Offline")
+        acknowledged = self.run_history.reconcile_acknowledged_exits(
+            service.id,
+            raw_states,
+        )
+        view = await self.status_resolver.resolve_service(
+            service,
+            raw_states,
+            controller_online=True,
+            acknowledged_exits=acknowledged,
+        )
+        if view["state"] not in {"External Running", "Mixed Running"}:
+            raise HubConflict(
+                "not_external",
+                "当前服务已不包含可纳管的外部运行项",
+                context={"state": view["state"]},
+            )
+
+        processes: list[dict[str, Any]] = []
+        external_records: list[dict[str, Any]] = []
+        for runtime in view.get("runtime_views", []):
+            process_id = str(runtime["process_id"])
+            raw_state = raw_states.get(process_id) or {}
+            runtime_state = str(runtime["state"])
+            if runtime_state == "External Running":
+                source = "external"
+            elif bool(raw_state.get("is_running", False)) or runtime_state in MANAGED_STATES:
+                source = "managed"
+            else:
+                source = "inactive"
+            record = {
+                "runtime_id": runtime["id"],
+                "process_id": process_id,
+                "port": int(runtime["port"]),
+                "source": source,
+                "state": runtime_state,
+                "pid": (
+                    int(raw_state["pid"])
+                    if source == "managed"
+                    and isinstance(raw_state.get("pid"), int)
+                    and int(raw_state["pid"]) > 0
+                    else None
+                ),
+                "process_name": "Process Compose" if source == "managed" else None,
+                "executable": None,
+                "command_line": runtime.get("command"),
+                "started_at": None,
+                "command": runtime.get("command"),
+            }
+            processes.append(record)
+            if source == "managed" and record["pid"] is None:
+                raise HubConflict(
+                    "runtime_confirmation_stale",
+                    f"运行项 {process_id} 缺少可确认的 PID，请刷新后重试",
+                    context={"processes": processes},
+                )
+            if source == "external":
+                external_records.append(record)
+
+        inspections = await asyncio.gather(
+            *(
+                asyncio.to_thread(inspect_listening_port, int(record["port"]))
+                for record in external_records
+            )
+        )
+        for record, inspected in zip(external_records, inspections, strict=True):
+            if not isinstance(inspected, dict):
+                raise HubConflict(
+                    "runtime_confirmation_stale",
+                    f"端口 {record['port']} 的外部进程已发生变化，请重新预览",
+                    context={"processes": processes},
+                )
+            record.update(
+                pid=inspected.get("pid"),
+                process_name=inspected.get("process_name"),
+                executable=inspected.get("executable"),
+                command_line=inspected.get("command_line") or record.get("command"),
+                started_at=inspected.get("started_at"),
+            )
+            if not isinstance(record.get("pid"), int) or int(record["pid"]) <= 0:
+                raise HubConflict(
+                    "runtime_confirmation_stale",
+                    f"端口 {record['port']} 缺少可确认的 PID，请刷新后重试",
+                    context={"processes": processes},
+                )
+        return view, processes
+
+    @staticmethod
+    def _takeover_signature(
+        processes: list[dict[str, Any]],
+    ) -> tuple[tuple[str, int, str, int | None], ...]:
+        return tuple(
+            (
+                str(item["process_id"]),
+                int(item["port"]),
+                str(item["source"]),
+                int(item["pid"]) if isinstance(item.get("pid"), int) else None,
+            )
+            for item in processes
+        )
+
+    async def _stop_managed_takeover_items(
+        self,
+        service: ServiceDefinition,
+        processes: list[dict[str, Any]],
+    ) -> None:
+        managed = [item for item in processes if item["source"] == "managed"]
+        if not managed:
+            return
         await asyncio.to_thread(
             self.run_history.mark_expected_exit,
             service.id,
             "restart",
         )
-        await self._restart_runtime_processes(service)
-        if self.store.get_service(service_id).active_config is not None:
-            self.store.set_active_config(service_id, None)
-        return {"service_id": service_id, "operation": "restart"}
+        for item in reversed(managed):
+            await self.process_compose.stop_process(str(item["process_id"]))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._stop_timeout_seconds
+        while True:
+            raw_states = await self.process_compose.list_processes()
+            running = [
+                item
+                for item in managed
+                if bool((raw_states.get(str(item["process_id"])) or {}).get("is_running"))
+                or str(
+                    (raw_states.get(str(item["process_id"])) or {}).get("status", "")
+                ).strip().lower()
+                in {"running", "pending", "starting", "launching"}
+            ]
+            if not running:
+                process_pids = {
+                    str(item["process_id"]): int(item["pid"])
+                    for item in managed
+                    if isinstance(item.get("pid"), int) and int(item["pid"]) > 0
+                }
+                await asyncio.to_thread(
+                    self.run_history.acknowledge_exits,
+                    service.id,
+                    process_pids,
+                )
+                await asyncio.to_thread(
+                    self.run_history.confirm_normal_stop,
+                    service.id,
+                    next(iter(process_pids.values()), None),
+                )
+                return
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise HubConflict(
+                    "stop_confirmation_timeout",
+                    "统一纳管时未能确认所有受管运行项已经停止",
+                )
+            await asyncio.sleep(min(0.2, remaining))
 
     async def takeover_service(
         self,
@@ -893,50 +1168,170 @@ class HubService:
         *,
         confirm: bool,
         pid: int | None,
+        pids: list[int] | None = None,
     ) -> dict[str, Any]:
         service = self.store.get_service(service_id)
         self._assert_enabled(service)
-        if len(service.items()) > 1:
-            raise HubConflict(
-                "multi_runtime_takeover_unsupported",
-                "多运行项服务需要先手动停止所有外部端口，再从管理器启动",
-            )
-        view = await self.get_service_view(service_id)
-        if view["state"] != "External Running":
-            raise HubConflict("not_external", "当前服务不是 External Running")
-        target_port = int(view.get("effective_port") or service.port)
-        inspected = await asyncio.to_thread(inspect_listening_port, target_port)
-        if inspected is None:
-            raise ProcessInspectionError(f"端口 {target_port} 已不再监听")
-        preview = {
-            "service": service.to_dict(),
-            "process": inspected,
-            "message": "将停止当前外部实例，然后改由 Process Compose 启动。",
-        }
         if not confirm:
+            _, processes = await self._takeover_runtime_snapshot(service)
+            self._takeover_previews[service.id] = self._takeover_signature(processes)
+            running_processes = [item for item in processes if item.get("pid")]
+            preview = {
+                "service": service.to_dict(),
+                "processes": processes,
+                # Preserve the original single-process response shape.
+                "process": running_processes[0] if len(running_processes) == 1 else None,
+                "message": "将逐项停止当前实例，然后全部改由 Process Compose 启动。",
+            }
             return {"requires_confirmation": True, **preview}
-        if pid is None or pid != inspected["pid"]:
-            raise HubConflict("pid_confirmation_required", "确认请求必须包含预览中的 PID")
-        if not view["controller_online"]:
-            raise ControllerOffline("Process Compose Controller Offline")
+        expected = {item for item in (pids or []) if isinstance(item, int) and item > 0}
+        if isinstance(pid, int) and pid > 0:
+            expected.add(pid)
 
-        await asyncio.to_thread(stop_confirmed_port_process, target_port, pid)
-        await self.process_compose.reload_configuration()
-        self._config_sync_warning = None
-        await self._start_runtime_processes(service)
-        if service.active_config is not None:
-            self.store.set_active_config(service_id, None)
+        async with self._mutation_lock:
+            service = self.store.get_service(service_id)
+            try:
+                _, fresh_processes = await self._takeover_runtime_snapshot(service)
+            except HubConflict as exc:
+                if exc.code != "not_external":
+                    raise
+                raise HubConflict(
+                    "runtime_confirmation_stale",
+                    "运行来源已发生变化；未停止任何进程，请重新确认",
+                    context=exc.context,
+                ) from exc
+            actual = {
+                int(item["pid"])
+                for item in fresh_processes
+                if isinstance(item.get("pid"), int) and int(item["pid"]) > 0
+            }
+            previous_signature = self._takeover_previews.get(service.id)
+            fresh_signature = self._takeover_signature(fresh_processes)
+            if expected != actual or (
+                previous_signature is not None
+                and previous_signature != fresh_signature
+            ):
+                raise HubConflict(
+                    "runtime_confirmation_stale",
+                    "运行项、端口或 PID 已发生变化；未停止任何进程，请重新确认",
+                    context={"processes": fresh_processes},
+                )
+
+            await self._archive_current_logs(service)
+            await self._stop_managed_takeover_items(service, fresh_processes)
+            external_by_pid: dict[int, dict[str, Any]] = {}
+            for item in fresh_processes:
+                if item["source"] == "external" and isinstance(item.get("pid"), int):
+                    external_by_pid.setdefault(int(item["pid"]), item)
+            for external_pid, item in external_by_pid.items():
+                await asyncio.to_thread(
+                    stop_confirmed_port_process,
+                    int(item["port"]),
+                    external_pid,
+                )
+            await self._ensure_runtime_ports_free(service)
+            await self.process_compose.reload_configuration()
+            self._config_sync_warning = None
+            await self._start_runtime_processes(service)
+            if service.active_config is not None:
+                self.store.set_active_config(service_id, None)
+            self._takeover_previews.pop(service.id, None)
         return {
             "requires_confirmation": False,
             "service_id": service_id,
             "operation": "takeover",
-            "stopped_pid": pid,
+            "stopped_pids": sorted(actual),
+            "stopped_pid": next(iter(actual)) if len(actual) == 1 else None,
         }
+
+    async def stop_external_service(
+        self,
+        service_id: str,
+        *,
+        confirm: bool,
+        pids: list[int] | None,
+    ) -> dict[str, Any]:
+        """Stop externally started processes without restarting the service."""
+        service = self.store.get_service(service_id)
+        self._assert_enabled(service)
+        view = await self.get_service_view(service_id)
+        if view["state"] != "External Running":
+            raise HubConflict("not_external", "当前服务不是外部运行状态")
+        candidate_ports = [int(view.get("effective_port") or service.port)]
+        candidate_ports.extend(item.port for item in service.items()[1:])
+        ports = list(dict.fromkeys(candidate_ports))
+        inspected = await asyncio.gather(
+            *(asyncio.to_thread(inspect_listening_port, port) for port in ports),
+        )
+        processes = [process for process in inspected if process is not None]
+        if not processes:
+            raise ProcessInspectionError("登记端口已无外部进程监听，请刷新状态")
+        if not confirm:
+            return {
+                "requires_confirmation": True,
+                "service": service.to_dict(),
+                "processes": processes,
+                "message": "将停止以上外部进程；服务不会自动重启。",
+            }
+        expected = sorted(pids or [])
+        actual = sorted(int(process["pid"]) for process in processes)
+        if expected != actual:
+            raise HubConflict(
+                "pid_confirmation_required",
+                "确认请求必须包含预览中的全部 PID",
+            )
+        for process in processes:
+            await asyncio.to_thread(
+                stop_confirmed_port_process,
+                int(process["port"]),
+                int(process["pid"]),
+            )
+        return {
+            "requires_confirmation": False,
+            "service_id": service_id,
+            "operation": "stop_external",
+            "stopped_pids": actual,
+        }
+
+    async def clear_last_run(self, service_id: str) -> dict[str, Any]:
+        """Drop the stored last-run record so its summary stops showing."""
+        service = self.store.get_service(service_id)
+        _, raw_states = await self._controller_and_states()
+        acknowledged_exits: dict[str, int] = {}
+        for item in self._all_runtime_items(service):
+            process_id = process_id_for(service.id, item.id)
+            raw_state = raw_states.get(process_id) or {}
+            pid = raw_state.get("pid")
+            if isinstance(pid, int) and pid > 0 and not bool(raw_state.get("is_running")):
+                acknowledged_exits[process_id] = pid
+        await asyncio.to_thread(
+            self.run_history.clear_last_run,
+            service_id,
+            acknowledged_exits=acknowledged_exits,
+        )
+        return {"service_id": service_id, "cleared": True}
 
     async def get_logs(self, service_id: str, limit: int) -> dict[str, Any]:
         service = self.store.get_service(service_id)
         self._assert_enabled(service)
-        logs = await self._combined_logs(service, limit=limit)
+        controller, raw_states = await self._controller_and_states()
+        if not controller["online"]:
+            raise ControllerOffline("Process Compose Controller Offline")
+        process_running = any(
+            bool((raw_states.get(process_id) or {}).get("is_running", False))
+            for process_id in (
+                process_id_for(service.id, item.id)
+                for item in self._all_runtime_items(service)
+            )
+        )
+        try:
+            logs = await self._combined_logs(service, limit=limit)
+        except ProcessComposeError:
+            # An externally started instance is not supervised by the
+            # controller, so it has no "current" logs; keep the archive usable.
+            if process_running:
+                raise
+            logs = []
         await asyncio.to_thread(self.log_archive.save_latest, service.id, logs)
         previous = await asyncio.to_thread(
             self.log_archive.read_previous,
@@ -948,16 +1343,15 @@ class HubService:
             self.run_history.get_last_run,
             service.id,
         )
-        last_error = (
-            current_diagnosis["last_error"]
-            or previous_diagnosis["last_error"]
-            or (last_run or {}).get("last_error")
+        current_last_error = (
+            current_diagnosis["last_error"] if process_running else None
         )
-        await asyncio.to_thread(
-            self.run_history.set_last_error,
-            service.id,
-            last_error,
+        previous_last_error = (
+            previous_diagnosis["last_error"] or (last_run or {}).get("last_error")
         )
+        # `last_error` remains as a compatibility field for existing clients,
+        # but reading logs no longer mutates the service's live status.
+        last_error = current_diagnosis["last_error"] or previous_last_error
         return {
             "service_id": service.id,
             "logs": logs,
@@ -965,6 +1359,8 @@ class HubService:
             "previous_logs": previous,
             "previous_entries": previous_diagnosis["entries"],
             "last_error": last_error,
+            "current_last_error": current_last_error,
+            "previous_last_error": previous_last_error,
             "stdout_lines": current_diagnosis["stdout_lines"],
             "stderr_lines": current_diagnosis["stderr_lines"],
             "limit": limit,

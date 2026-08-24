@@ -7,6 +7,7 @@ const state = {
   refreshing: false,
   urlAutofill: true,
   takeover: null,
+  stopExternal: null,
   logService: null,
   logData: null,
   logView: "current",
@@ -20,12 +21,14 @@ const state = {
   filter: "all",
   view: readSavedView(),
   lastFetchedAt: null,
+  autoRefreshDeferred: false,
 };
 
 const statePresentation = {
   Healthy: { symbol: "●", label: "运行中", tone: "running", origin: "本管理器启动" },
   "Managed Running": { symbol: "●", label: "运行中", tone: "running", origin: "本管理器启动" },
-  "External Running": { symbol: "●", label: "运行中", tone: "running", origin: "外部接入", originTone: "external" },
+  "External Running": { symbol: "●", label: "外部运行", tone: "external", origin: "外部接入", originTone: "external" },
+  "Mixed Running": { symbol: "!", label: "混合运行", tone: "mixed", origin: "来源不一致", originTone: "mixed" },
   Starting: { symbol: "◐", label: "启动中", tone: "starting", origin: "本管理器启动" },
   Unhealthy: { symbol: "!", label: "异常", tone: "error", origin: "本管理器启动" },
   Error: { symbol: "!", label: "异常", tone: "error", origin: "本管理器启动" },
@@ -39,18 +42,20 @@ const operationPresentation = {
   stop: { symbol: "◐", label: "停止中", tone: "starting", origin: "本管理器启动" },
   restart: { symbol: "◐", label: "重启中", tone: "starting", origin: "本管理器启动" },
   takeover: { symbol: "◐", label: "启动中", tone: "starting", origin: "正在纳入管理" },
+  stopExternal: { symbol: "◐", label: "停止中", tone: "starting", origin: "正在停止外部进程" },
   remove: { symbol: "◐", label: "停止中", tone: "starting", origin: "正在移除登记" },
 };
 
-const operationLabels = { start: "启动", stop: "停止", restart: "重启", takeover: "纳入管理", remove: "移除登记" };
+const operationLabels = { start: "启动", stop: "停止", restart: "重启", takeover: "纳入管理", stopExternal: "停止外部进程", remove: "移除登记" };
 const typeLabels = { frontend: "Frontend", backend: "Backend", fullstack: "Fullstack", worker: "Worker", plugin: "Plugin", other: "Other" };
 const healthTypeLabels = { process: "进程存在", tcp: "TCP 端口", http: "HTTP 请求", multi: "多端口" };
 const healthStatusLabels = { passing: "正常", checking: "检查中", failing: "失败", inactive: "未运行", unknown: "未知" };
 const exitTypeLabels = { normal_stop: "正常停止", abnormal_exit: "异常退出", start_failed: "启动失败" };
-const planStatusLabels = { pending: "等待中", starting: "启动中", running: "已启动", already_running: "已在运行", external_running: "外部运行", error: "失败" };
+const planStatusLabels = { pending: "等待中", starting: "启动中", running: "已启动", already_running: "已在运行", external_running: "外部接入", error: "失败" };
 const managedStates = new Set(["Healthy", "Managed Running", "Starting", "Unhealthy"]);
-const openableStates = new Set(["Healthy", "Managed Running", "External Running", "Unhealthy"]);
-const errorStates = new Set(["Unhealthy", "Error", "Unknown"]);
+const openableStates = new Set(["Healthy", "Managed Running", "External Running", "Mixed Running", "Unhealthy"]);
+const faultStates = new Set(["Unhealthy", "Error", "Unknown"]);
+const issueStates = new Set([...faultStates, "Mixed Running"]);
 const $ = (selector) => document.querySelector(selector);
 
 function readSavedView() {
@@ -89,7 +94,10 @@ function toast(message, isError = false) {
 
 function presentationFor(service) {
   const operation = state.busy.get(service.id);
-  return operationPresentation[operation] || statePresentation[service.state] || statePresentation.Unknown;
+  if (operation && !actionHasSettled(operation, service)) {
+    return operationPresentation[operation] || statePresentation.Unknown;
+  }
+  return statePresentation[service.state] || statePresentation.Unknown;
 }
 
 function statusBlock(service, { compact = false } = {}) {
@@ -150,7 +158,7 @@ function actionMenu(service, controllerOnline) {
   const summary = element("summary", "menu-trigger", "···");
   summary.setAttribute("aria-label", `${service.name} 更多操作`);
   const panel = element("div", "menu-panel");
-  const canReadLogs = service.enabled && service.state !== "External Running";
+  const canReadLogs = service.enabled;
   if (canReadLogs) panel.append(createMenuAction("查看日志", "logs", service, { disabled: !controllerOnline }));
   panel.append(
     createMenuAction("打开项目目录", "open-directory", service),
@@ -158,11 +166,13 @@ function actionMenu(service, controllerOnline) {
     createMenuAction("编辑配置", "edit", service),
     createMenuAction("查看详情", "details", service),
   );
-  if (service.state === "External Running") {
-    const multiRuntime = runtimeItemsFor(service).length > 1;
-    panel.append(createMenuAction(multiRuntime ? "多端口需手动停止后启动" : "纳入管理", "takeover", service, { disabled: !controllerOnline || multiRuntime }));
-  }
-  panel.append(element("div", "menu-separator"), createMenuAction("移除登记", "remove", service, { danger: true }));
+  panel.append(
+    element("div", "menu-separator"),
+    createMenuAction("移除登记", "remove", service, {
+      danger: true,
+      disabled: service.state === "Mixed Running",
+    }),
+  );
   menu.append(summary, panel);
   return menu;
 }
@@ -210,10 +220,20 @@ function lastRunSummary(service) {
   if (!run || !["Stopped", "Disabled", "Error"].includes(service.state)) return null;
   const block = element("div", "last-run-summary");
   block.dataset.exit = run.exit_type || "";
-  block.append(
+  const info = element("span", "last-run-info");
+  info.append(
     element("strong", "", exitTypeLabels[run.exit_type] || "上次运行"),
     element("span", "", `${formatDuration(run.duration_seconds)} · ${formatShortTime(run.stopped_at)}`),
   );
+  block.append(info);
+  if (["abnormal_exit", "start_failed"].includes(run.exit_type)) {
+    const dismiss = element("button", "last-run-dismiss", "清除");
+    dismiss.type = "button";
+    dismiss.title = "清除这条异常退出提示";
+    dismiss.dataset.action = "dismiss-last-run";
+    dismiss.dataset.service = service.id;
+    block.append(dismiss);
+  }
   return block;
 }
 
@@ -255,14 +275,21 @@ function renderGroups() {
 
 function operationError(service) {
   const localError = state.actionErrors.get(service.id);
-  const message = localError?.message || service.last_error || service.error;
+  const currentFault = faultStates.has(service.state);
+  const message = localError?.message || (currentFault ? service.last_error || service.error : null);
   if (!message) return null;
   const operation = localError?.operation;
-  const box = element("div", "operation-error");
-  box.append(
-    element("strong", "", `⚠ ${operation ? `${operationLabels[operation] || "操作"}失败` : "服务异常"}`),
-    element("p", "", message),
-  );
+  const box = element("div", localError ? "action-feedback" : "operation-error");
+  const heading = element("div", "feedback-heading");
+  heading.append(element("strong", "", `⚠ ${operation ? `${operationLabels[operation] || "操作"}失败` : "当前故障"}`));
+  if (localError) {
+    const dismiss = element("button", "feedback-dismiss", "关闭");
+    dismiss.type = "button";
+    dismiss.dataset.action = "dismiss-action-error";
+    dismiss.dataset.service = service.id;
+    heading.append(dismiss);
+  }
+  box.append(heading, element("p", "", message));
   const conflict = localError?.details?.port_conflict;
   if (conflict) {
     const process = conflict.process_name || "未知进程";
@@ -275,7 +302,7 @@ function operationError(service) {
   }
   const links = element("div", "error-actions");
   links.append(createAction("查看详情", "button-quiet", "details", service));
-  if (service.enabled && service.state !== "External Running") links.append(createAction("查看日志", "button-quiet", "logs", service));
+  if (service.enabled) links.append(createAction("查看日志", "button-quiet", "logs", service));
   box.append(links);
   return box;
 }
@@ -323,6 +350,25 @@ function serviceCard(service, controllerOnline) {
     actions.append(createAction(operation === "restart" ? "重启中…" : service.pending_restart ? "应用配置并重启" : "重启", "button-secondary", "restart", service, !controllerOnline));
     actions.append(createAction(operation === "stop" ? "停止中…" : "停止", "button-quiet", "stop", service, !controllerOnline));
   }
+  if (service.state === "External Running") {
+    actions.append(createAction("停止外部进程", "button-quiet", "stop-external", service));
+    actions.append(createAction(
+      operation === "takeover" ? "正在重新纳入…" : "重新纳入管理",
+      "button-secondary",
+      "takeover",
+      service,
+      !controllerOnline,
+    ));
+  }
+  if (service.state === "Mixed Running") {
+    actions.append(createAction(
+      operation === "takeover" ? "正在统一纳管…" : "统一纳入管理",
+      "button-secondary",
+      "takeover",
+      service,
+      !controllerOnline,
+    ));
+  }
   actions.append(actionMenu(service, controllerOnline));
 
   card.append(top, facts);
@@ -338,10 +384,10 @@ function serviceCard(service, controllerOnline) {
 }
 
 function matchesFilter(service) {
-  if (state.filter === "running") return ["Healthy", "Managed Running", "Starting", "External Running"].includes(service.state);
+  if (state.filter === "running") return ["Healthy", "Managed Running", "Starting", "External Running", "Mixed Running"].includes(service.state);
   if (state.filter === "stopped") return ["Stopped", "Disabled"].includes(service.state);
-  if (state.filter === "external") return service.state === "External Running";
-  if (state.filter === "error") return errorStates.has(service.state);
+  if (state.filter === "external") return ["External Running", "Mixed Running"].includes(service.state);
+  if (state.filter === "error") return issueStates.has(service.state);
   return true;
 }
 
@@ -359,11 +405,17 @@ function filteredServices() {
 }
 
 function renderHeroSummary(services) {
-  const running = services.filter((item) => ["Healthy", "Managed Running", "External Running"].includes(item.state)).length;
+  const running = services.filter((item) => ["Healthy", "Managed Running"].includes(item.state)).length;
+  const starting = services.filter((item) => item.state === "Starting").length;
   const external = services.filter((item) => item.state === "External Running").length;
+  const mixed = services.filter((item) => item.state === "Mixed Running").length;
   const stopped = services.filter((item) => ["Stopped", "Disabled"].includes(item.state)).length;
-  const issues = services.filter((item) => errorStates.has(item.state)).length;
-  const parts = [`${services.length} 个服务`, `${running} 运行中`, `${external} 外部接入`, `${stopped} 已停止`];
+  const issues = services.filter((item) => issueStates.has(item.state)).length;
+  const parts = [`${services.length} 个服务`, `${running} 运行中`];
+  if (starting) parts.push(`${starting} 启动中`);
+  parts.push(`${external} 外部接入`);
+  if (mixed) parts.push(`${mixed} 混合运行`);
+  parts.push(`${stopped} 已停止`);
   if (issues) parts.push(`${issues} 异常`);
   $("#hero-summary").textContent = parts.join(" · ");
 }
@@ -374,6 +426,7 @@ function renderServices(snapshot = null) {
     state.lastFetchedAt = new Date();
   }
   if (!state.snapshot) return;
+  pruneActionErrors();
   setController(state.snapshot.controller, state.snapshot.configuration);
   setStoreStatus(state.snapshot.store);
   renderHeroSummary(state.snapshot.services);
@@ -428,10 +481,31 @@ async function refreshPorts({ announceError = false } = {}) {
   } finally { button.disabled = false; }
 }
 
-async function refreshServices({ announceError = false } = {}) {
+function interactionBlocksAutoRefresh() {
+  return Boolean(
+    document.querySelector("dialog[open]")
+    || document.querySelector(".action-menu[open]")
+    || state.busy.size
+    || state.groupBusy,
+  );
+}
+
+async function refreshServices({ announceError = false, automatic = false } = {}) {
+  if (automatic && interactionBlocksAutoRefresh()) {
+    state.autoRefreshDeferred = true;
+    return;
+  }
   if (state.refreshing || state.shuttingDown || state.restarting) return;
   state.refreshing = true; $("#refresh-services").disabled = true;
-  try { renderServices(await fetchJSON("/api/services")); }
+  try {
+    const snapshot = await fetchJSON("/api/services");
+    if (automatic && interactionBlocksAutoRefresh()) {
+      state.autoRefreshDeferred = true;
+      return;
+    }
+    state.autoRefreshDeferred = false;
+    renderServices(snapshot);
+  }
   catch (error) {
     if (announceError || !state.snapshot) toast(error.message, true);
     if (!state.snapshot) $("#services-grid").replaceChildren(element("div", "empty-state", "Service Hub API 暂时不可用。"));
@@ -449,8 +523,46 @@ function updateServiceSnapshot(service) {
   renderServices();
 }
 
+function setActionError(serviceId, operation, error) {
+  const snapshotState = state.snapshot?.services.find((item) => item.id === serviceId)?.state;
+  state.actionErrors.set(serviceId, {
+    operation,
+    message: error.message,
+    code: error.code,
+    details: error.details,
+    stateAtError: snapshotState || "Unknown",
+  });
+}
+
+function pruneActionErrors() {
+  for (const [id, entry] of state.actionErrors) {
+    if (state.busy.has(id)) continue;
+    const service = state.snapshot?.services.find((item) => item.id === id);
+    if (entry.code === "port_conflict") {
+      const conflict = entry.details?.port_conflict;
+      const occupant = service?.port_occupant;
+      const stillSameOccupant = Boolean(
+        conflict
+        && occupant
+        && Number(conflict.port) === Number(occupant.port)
+        && Number(conflict.pid || 0) === Number(occupant.pid || 0),
+      );
+      if (!stillSameOccupant) state.actionErrors.delete(id);
+      continue;
+    }
+    if (!service || service.state !== entry.stateAtError) state.actionErrors.delete(id);
+  }
+}
+
 function actionHasSettled(operation, service) {
-  if (operation === "stop") return ["Stopped", "Disabled", "Error", "Unknown"].includes(service.state);
+  if (operation === "stop" || operation === "stopExternal") {
+    // A stop still settles when the freed port is immediately re-occupied by
+    // an external process: the managed stop itself has completed.
+    return ["Stopped", "Disabled", "Error", "Unknown", "External Running"].includes(service.state);
+  }
+  if (operation === "takeover") {
+    return ["Healthy", "Managed Running", "Unhealthy", "Error", "Unknown"].includes(service.state);
+  }
   return ["Healthy", "Managed Running", "Unhealthy", "Error", "Unknown", "External Running"].includes(service.state);
 }
 
@@ -639,11 +751,23 @@ function openServiceForm(service = null, port = null) {
 function chooseRestart() {
   return new Promise((resolve) => {
     const dialog = $("#restart-choice-dialog");
-    const handler = (event) => {
-      const button = event.target.closest("[data-choice]"); if (!button) return;
-      dialog.removeEventListener("click", handler); dialog.close(); resolve(button.dataset.choice);
+    const onClick = (event) => {
+      const button = event.target.closest("[data-choice]");
+      if (!button) return;
+      dialog.removeEventListener("click", onClick);
+      dialog.removeEventListener("close", onClose);
+      dialog.close();
+      resolve(button.dataset.choice);
     };
-    dialog.addEventListener("click", handler); dialog.showModal();
+    // Esc and any other close path count as "cancel"; the listeners must be
+    // removed either way or a later submit would run twice.
+    const onClose = () => {
+      dialog.removeEventListener("click", onClick);
+      resolve("cancel");
+    };
+    dialog.addEventListener("click", onClick);
+    dialog.addEventListener("close", onClose);
+    dialog.showModal();
   });
 }
 
@@ -806,6 +930,28 @@ async function removeGroup(group) {
   } catch (error) { toast(error.message, true); }
 }
 
+function toastActionOutcome(service, operation, finalState, planLength) {
+  if (planLength > 1) {
+    toast(`${service.name}：已按依赖顺序处理 ${planLength} 个服务`);
+    return;
+  }
+  const actionName = operationLabels[operation] || "操作";
+  if (operation === "stop" || operation === "stopExternal") {
+    if (finalState === "External Running") toast(`${service.name}：已停止；端口随即被新的外部进程占用`);
+    else toast(`${service.name}：${actionName}已完成`);
+    return;
+  }
+  if (["Healthy", "Managed Running"].includes(finalState)) {
+    toast(`${service.name}：${actionName}完成，服务运行正常`);
+    return;
+  }
+  if (["Unhealthy", "Error"].includes(finalState)) {
+    toast(`${service.name}：${actionName}已完成，但健康检查未通过`, true);
+    return;
+  }
+  toast(`${service.name}：${actionName}已提交，当前状态：${statePresentation[finalState]?.label || finalState}`);
+}
+
 async function runAction(service, operation) {
   state.busy.set(service.id, operation);
   state.actionErrors.delete(service.id);
@@ -815,14 +961,28 @@ async function runAction(service, operation) {
     const actionResult = await fetchJSON(`/api/services/${encodeURIComponent(service.id)}/${operation}`, { method: "POST" });
     submitted = true;
     const result = await refreshServiceAfterAction(service, operation);
-    if (result.settled && actionResult.plan?.length > 1) toast(`${service.name}：已按依赖顺序处理 ${actionResult.plan.length} 个服务`);
-    else if (result.settled) toast(`${service.name}：${operationLabels[operation]}操作已完成，状态已更新`);
-    else toast(`${service.name}：操作已提交，状态仍在确认中，可稍后手动刷新`);
+    if (!result.settled) toast(`${service.name}：操作已提交，仍在确认状态，页面会自动更新`);
+    else toastActionOutcome(service, operation, result.service?.state, actionResult.plan?.length || 0);
   } catch (error) {
     if (submitted) {
       toast(`${service.name}：操作已提交，但自动刷新失败：${error.message}`, true);
+    } else if (operation === "restart" && ["external_running", "not_managed"].includes(error.code)) {
+      try {
+        const current = await fetchJSON(`/api/services/${encodeURIComponent(service.id)}`);
+        updateServiceSnapshot(current);
+        if (["External Running", "Mixed Running"].includes(current.state)) {
+          toast(`${service.name} 包含外部运行项，请确认是否统一纳入管理`);
+          await previewTakeover(current, { title: "确认统一纳入管理" });
+        } else {
+          setActionError(service.id, operation, error);
+          toast(`${service.name}：${error.message}`, true);
+        }
+      } catch (refreshError) {
+        setActionError(service.id, operation, error);
+        toast(`${service.name}：${refreshError.message}`, true);
+      }
     } else {
-      state.actionErrors.set(service.id, { operation, message: error.message, code: error.code, details: error.details });
+      setActionError(service.id, operation, error);
       toast(`${service.name}：${error.message}`, true);
     }
   } finally {
@@ -859,7 +1019,7 @@ async function confirmRemove() {
     toast(result.external_process_continues ? "登记已移除；外部进程仍在运行" : "服务登记已移除");
     await Promise.all([refreshServices({ announceError: true }), refreshPorts()]);
   } catch (error) {
-    state.actionErrors.set(service.id, { operation: "remove", message: error.message, code: error.code });
+    setActionError(service.id, "remove", error);
     toast(error.message, true);
   } finally {
     state.busy.delete(service.id);
@@ -869,15 +1029,30 @@ async function confirmRemove() {
   }
 }
 
-async function previewTakeover(service) {
+async function previewTakeover(service, { title = "纳入 Process Compose 管理" } = {}) {
+  state.busy.set(service.id, "takeover");
+  renderServices();
   try {
     const data = await fetchJSON(`/api/services/${encodeURIComponent(service.id)}/takeover`, { method: "POST", body: JSON.stringify({ confirm: false }) });
-    state.takeover = { service, pid: data.process.pid };
+    const processes = data.processes?.length ? data.processes : data.process ? [data.process] : [];
+    const pids = [...new Set(processes.map((process) => Number(process.pid)).filter((pid) => pid > 0))];
+    state.takeover = { service, pids };
     const details = $("#takeover-details"); details.replaceChildren();
-    const fields = [["服务", data.service.name], ["端口", `:${data.service.port}`], ["PID", String(data.process.pid)], ["进程", data.process.process_name || "不可用"], ["可执行文件", data.process.executable || "不可用"], ["实际命令", data.process.command_line || "不可用"], ["登记目录", data.service.working_dir], ["登记命令", data.service.command]];
-    fields.forEach(([label, value]) => { details.append(element("dt", "", label), element("dd", "", value)); });
+    details.append(element("dt", "", "服务"), element("dd", "", data.service.name));
+    processes.forEach((process) => {
+      const source = process.source === "managed" ? "管理器" : process.source === "external" ? "外部进程" : "未运行";
+      const identity = process.pid ? `PID ${process.pid} · ${process.process_name || "未知进程"}` : "无当前 PID";
+      const command = process.command_line || process.command || "命令不可用";
+      details.append(
+        element("dt", "", `端口 :${process.port}`),
+        element("dd", "", `${source} · ${identity} · ${command}`),
+      );
+    });
+    details.append(element("dt", "", "登记目录"), element("dd", "", data.service.working_dir));
+    $("#takeover-dialog-title").textContent = service.state === "Mixed Running" ? "统一纳入 Process Compose 管理" : title;
     $("#takeover-dialog").showModal();
-  } catch (error) { state.actionErrors.set(service.id, { operation: "takeover", message: error.message }); toast(error.message, true); renderServices(); }
+  } catch (error) { setActionError(service.id, "takeover", error); toast(error.message, true); }
+  finally { state.busy.delete(service.id); renderServices(); }
 }
 
 async function confirmTakeover() {
@@ -886,13 +1061,58 @@ async function confirmTakeover() {
   const button = $("#confirm-takeover"); button.disabled = true; button.textContent = "正在纳入管理…";
   state.busy.set(service.id, "takeover"); renderServices();
   try {
-    await fetchJSON(`/api/services/${encodeURIComponent(service.id)}/takeover`, { method: "POST", body: JSON.stringify({ confirm: true, pid: state.takeover.pid }) });
+    const confirmation = { confirm: true, pids: state.takeover.pids };
+    if (state.takeover.pids.length === 1) confirmation.pid = state.takeover.pids[0];
+    await fetchJSON(`/api/services/${encodeURIComponent(service.id)}/takeover`, { method: "POST", body: JSON.stringify(confirmation) });
     $("#takeover-dialog").close();
     const result = await refreshServiceAfterAction(service, "takeover");
     if (result.settled) toast("外部实例已停止，服务已由本管理器启动");
-    else toast(`${service.name}：操作已提交，状态仍在确认中，可稍后手动刷新`);
-  } catch (error) { state.actionErrors.set(service.id, { operation: "takeover", message: error.message }); toast(error.message, true); }
-  finally { state.busy.delete(service.id); button.disabled = false; button.textContent = "确认停止并纳管"; renderServices(); }
+    else toast(`${service.name}：操作已提交，仍在确认状态，页面会自动更新`);
+  } catch (error) { setActionError(service.id, "takeover", error); toast(error.message, true); }
+  finally { state.busy.delete(service.id); button.disabled = false; button.textContent = "确认统一纳管"; renderServices(); }
+}
+
+async function previewStopExternal(service) {
+  state.busy.set(service.id, "stopExternal");
+  renderServices();
+  try {
+    const data = await fetchJSON(`/api/services/${encodeURIComponent(service.id)}/stop-external`, { method: "POST", body: JSON.stringify({ confirm: false }) });
+    state.stopExternal = { service, pids: data.processes.map((process) => process.pid) };
+    const details = $("#external-stop-details"); details.replaceChildren();
+    data.processes.forEach((process) => {
+      const summary = `PID ${process.pid} · ${process.process_name || "未知进程"}`;
+      details.append(
+        element("dt", "", `端口 :${process.port}`),
+        element("dd", "", process.command_line ? `${summary} · ${process.command_line}` : summary),
+      );
+    });
+    $("#external-stop-dialog").showModal();
+  } catch (error) { setActionError(service.id, "stopExternal", error); toast(error.message, true); }
+  finally { state.busy.delete(service.id); renderServices(); }
+}
+
+async function confirmStopExternal() {
+  if (!state.stopExternal) return;
+  const service = state.stopExternal.service;
+  const button = $("#confirm-stop-external"); button.disabled = true; button.textContent = "正在停止…";
+  state.busy.set(service.id, "stopExternal"); renderServices();
+  try {
+    await fetchJSON(`/api/services/${encodeURIComponent(service.id)}/stop-external`, { method: "POST", body: JSON.stringify({ confirm: true, pids: state.stopExternal.pids }) });
+    $("#external-stop-dialog").close();
+    const result = await refreshServiceAfterAction(service, "stopExternal");
+    if (result.settled) toast(`${service.name}：外部进程已停止，服务回到已停止状态`);
+    else toast(`${service.name}：停止请求已提交，仍在确认状态，页面会自动更新`);
+  } catch (error) { setActionError(service.id, "stopExternal", error); toast(error.message, true); }
+  finally { state.busy.delete(service.id); button.disabled = false; button.textContent = "确认停止外部进程"; renderServices(); }
+}
+
+async function dismissLastRun(service) {
+  try {
+    await fetchJSON(`/api/services/${encodeURIComponent(service.id)}/last-run`, { method: "DELETE" });
+    const current = await fetchJSON(`/api/services/${encodeURIComponent(service.id)}`);
+    updateServiceSnapshot(current);
+    toast(`${service.name}：已清除运行记录，异常状态已归位`);
+  } catch (error) { toast(error.message, true); }
 }
 
 function formatStartedAt(value) {
@@ -907,7 +1127,14 @@ function openDetails(service) {
   state.detailsService = current;
   $("#details-title").textContent = current.name;
   const status = $("#details-status"); status.replaceChildren(statusBlock(current));
-  if (current.error || current.last_error || state.actionErrors.get(current.id)) status.append(element("p", "details-error", state.actionErrors.get(current.id)?.message || current.last_error || current.error));
+  const localFeedback = state.actionErrors.get(current.id);
+  if (localFeedback) {
+    status.append(element("p", "details-warning", localFeedback.message));
+  } else if (faultStates.has(current.state) && (current.last_error || current.error)) {
+    status.append(element("p", "details-error", current.last_error || current.error));
+  } else if (current.state === "Mixed Running" && current.error) {
+    status.append(element("p", "details-warning", current.error));
+  }
   const list = $("#details-list"); list.replaceChildren();
   const presentation = presentationFor(current);
   const healthMode = current.effective_health_check_type || current.health_check_type;
@@ -970,13 +1197,14 @@ function openDetails(service) {
     );
   }
   rows.forEach(([label, value]) => { list.append(element("dt", "", label), element("dd", "", value)); });
-  $("#details-open-logs").hidden = !current.enabled || current.state === "External Running";
+  $("#details-open-logs").hidden = !current.enabled;
   $("#details-dialog").showModal();
 }
 
 async function openLogs(service) {
   state.logService = service; state.logData = null; state.logView = "current";
   $("#logs-title").textContent = `${service.name} · 日志诊断`;
+  $("#logs-external-note").hidden = !["External Running", "Mixed Running"].includes(service.state);
   $("#logs-output").textContent = "正在载入…"; $("#logs-dialog").showModal(); await refreshLogs();
 }
 
@@ -993,8 +1221,9 @@ function renderLogs() {
   $("#clear-logs").hidden = previous;
   $("#logs-counts").textContent = previous ? `${entries.length} 行归档` : `stdout ${data.stdout_lines} · stderr ${data.stderr_lines}`;
   const summary = $("#logs-error-summary");
-  summary.hidden = !data.last_error;
-  summary.textContent = data.last_error ? `最近错误：${data.last_error}` : "";
+  const selectedError = previous ? data.previous_last_error : data.current_last_error;
+  summary.hidden = !selectedError;
+  summary.textContent = selectedError ? `${previous ? "上次运行错误" : "当前运行错误"}：${selectedError}` : "";
   const output = $("#logs-output"); output.replaceChildren();
   if (!entries.length) {
     output.append(element("div", "logs-empty", previous ? "暂无上一轮运行日志" : "暂无当前运行日志"));
@@ -1133,10 +1362,13 @@ $("#services-grid").addEventListener("click", async (event) => {
   else if (action === "edit") openServiceForm(service);
   else if (action === "remove") requestRemove(service);
   else if (action === "takeover") await previewTakeover(service);
+  else if (action === "stop-external") await previewStopExternal(service);
   else if (action === "logs") await openLogs(service);
   else if (action === "details") openDetails(service);
   else if (action === "copy-url") await copyServiceUrl(service);
   else if (action === "open-directory") await openDirectory(service);
+  else if (action === "dismiss-last-run") await dismissLastRun(service);
+  else if (action === "dismiss-action-error") { state.actionErrors.delete(service.id); renderServices(); }
 });
 document.addEventListener("click", (event) => { const menu = event.target.closest(".action-menu"); if (!menu) closeActionMenus(); else if (event.target.closest(".menu-item")) menu.removeAttribute("open"); });
 document.querySelectorAll("[data-close]").forEach((button) => button.addEventListener("click", () => $(`#${button.dataset.close}`).close()));
@@ -1174,6 +1406,9 @@ $("#refresh-services").addEventListener("click", () => refreshServices({ announc
 $("#controller-alert").addEventListener("click", (event) => { if (event.target.closest('[data-action="retry"]')) refreshServices({ announceError: true }); });
 $("#restore-backup").addEventListener("click", async () => { if (!window.confirm("确认使用 services.json.bak 恢复登记吗？损坏文件会另存保留。")) return; try { await fetchJSON("/api/store/restore-backup", { method: "POST" }); toast("已从备份恢复"); await refreshServices({ announceError: true }); } catch (error) { toast(error.message, true); } });
 $("#confirm-takeover").addEventListener("click", confirmTakeover);
+$("#confirm-stop-external").addEventListener("click", confirmStopExternal);
+$("#takeover-dialog").addEventListener("close", () => { state.takeover = null; });
+$("#external-stop-dialog").addEventListener("close", () => { state.stopExternal = null; });
 $("#confirm-remove").addEventListener("click", confirmRemove);
 $("#refresh-logs").addEventListener("click", refreshLogs);
 $("#copy-logs").addEventListener("click", copyLogs);
@@ -1200,3 +1435,36 @@ $("#view-switch").addEventListener("click", (event) => {
 
 syncHealthCheckFields($("#service-form"));
 Promise.all([refreshServices({ announceError: true }), refreshPorts({ announceError: true })]);
+
+const AUTO_REFRESH_INTERVAL_MS = 5000;
+let autoRefreshTimer = null;
+let deferredRefreshTimer = null;
+
+function resumeDeferredRefresh() {
+  if (!state.autoRefreshDeferred || document.hidden || interactionBlocksAutoRefresh()) return;
+  if (deferredRefreshTimer) window.clearTimeout(deferredRefreshTimer);
+  deferredRefreshTimer = window.setTimeout(async () => {
+    deferredRefreshTimer = null;
+    if (interactionBlocksAutoRefresh()) return;
+    await refreshServices({ automatic: true });
+  }, 0);
+}
+
+function scheduleAutoRefresh() {
+  if (autoRefreshTimer) window.clearTimeout(autoRefreshTimer);
+  autoRefreshTimer = window.setTimeout(async () => {
+    if (!document.hidden) await refreshServices({ automatic: true });
+    scheduleAutoRefresh();
+  }, AUTO_REFRESH_INTERVAL_MS);
+}
+document.addEventListener("close", resumeDeferredRefresh, true);
+document.addEventListener("toggle", (event) => {
+  if (event.target.matches?.(".action-menu") && !event.target.open) resumeDeferredRefresh();
+}, true);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) {
+    state.autoRefreshDeferred = true;
+    resumeDeferredRefresh();
+  }
+});
+scheduleAutoRefresh();

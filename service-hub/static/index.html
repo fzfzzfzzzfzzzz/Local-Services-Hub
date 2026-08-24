@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="description" content="Local Service Hub — 本地服务登记与控制中心" />
     <title>Local Service Hub</title>
-    <link rel="stylesheet" href="/static/style.css?v=1.0.0-external-origin" />
-    <script src="/static/app.js?v=1.0.0-external-origin" defer></script>
+    <link rel="stylesheet" href="/static/style.css?v=1.2.0-state-consistency" />
+    <script src="/static/app.js?v=1.2.0-state-consistency" defer></script>
   </head>
   <body>
     <div class="page-shell">
@@ -71,7 +71,7 @@
               <button class="filter-chip is-active" data-filter="all" type="button">全部</button>
               <button class="filter-chip" data-filter="running" type="button">运行中</button>
               <button class="filter-chip" data-filter="stopped" type="button">已停止</button>
-              <button class="filter-chip" data-filter="external" type="button">外部运行</button>
+              <button class="filter-chip" data-filter="external" type="button">外部接入</button>
               <button class="filter-chip" data-filter="error" type="button">异常</button>
             </div>
             <div id="view-switch" class="view-switch" aria-label="服务视图">
@@ -157,7 +157,8 @@
     <dialog id="restart-choice-dialog" class="modal modal-small">
       <div class="modal-shell">
         <header class="modal-header"><div><p class="eyebrow">RUNNING SERVICE</p><h2>配置何时生效？</h2></div></header>
-        <p class="modal-copy">运行端口、启动命令或项目目录已改变。这些修改需要重启后生效。</p>
+        <p class="modal-copy">运行端口、启动命令或项目目录已改变，这些修改需要重启后才能生效。</p>
+        <p class="field-help">保存并重启：立即停止当前实例，并以新配置重新启动，期间会短暂中断服务。<br />保存但暂不重启：登记先更新，当前实例继续按旧配置运行，新配置在下次启动时才应用。</p>
         <div class="choice-actions">
           <button class="button button-secondary" data-choice="cancel" type="button">取消</button>
           <button class="button button-quiet" data-choice="defer" type="button">保存但暂不重启</button>
@@ -169,15 +170,31 @@
     <dialog id="takeover-dialog" class="modal modal-small">
       <div class="modal-shell">
         <header class="modal-header">
-          <div><p class="eyebrow">TAKE OVER</p><h2>纳入 Process Compose 管理</h2></div>
+          <div><p class="eyebrow">TAKE OVER</p><h2 id="takeover-dialog-title">纳入 Process Compose 管理</h2></div>
           <button class="icon-button" data-close="takeover-dialog" type="button" aria-label="关闭">×</button>
         </header>
-        <p class="modal-copy">将停止当前外部实例，然后使用登记的目录和命令重新启动。</p>
+        <p class="modal-copy">将停止上方列出的受管与外部运行项，然后使用登记的目录和命令统一重启。</p>
         <dl id="takeover-details" class="detail-list"></dl>
         <p class="warning-copy">仅会处理上方登记端口对应的 PID。确认前不会停止进程。</p>
         <div class="modal-actions">
           <button class="button button-secondary" data-close="takeover-dialog" type="button">取消</button>
-          <button id="confirm-takeover" class="button button-danger" type="button">确认停止并纳管</button>
+          <button id="confirm-takeover" class="button button-danger" type="button">确认统一纳管</button>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog id="external-stop-dialog" class="modal modal-small">
+      <div class="modal-shell">
+        <header class="modal-header">
+          <div><p class="eyebrow">EXTERNAL PROCESS</p><h2 id="external-stop-title">停止外部进程</h2></div>
+          <button class="icon-button" data-close="external-stop-dialog" type="button" aria-label="关闭">×</button>
+        </header>
+        <p class="modal-copy">以下外部进程正在占用登记端口。确认后会终止这些进程，服务将回到“已停止”，不会自动重启。</p>
+        <dl id="external-stop-details" class="detail-list"></dl>
+        <p class="warning-copy">只会停止上方列出的 PID；确认前不会终止任何进程。</p>
+        <div class="modal-actions">
+          <button class="button button-secondary" data-close="external-stop-dialog" type="button">取消</button>
+          <button id="confirm-stop-external" class="button button-danger" type="button">确认停止外部进程</button>
         </div>
       </div>
     </dialog>
@@ -189,6 +206,7 @@
           <button class="icon-button" data-close="logs-dialog" type="button" aria-label="关闭">×</button>
         </header>
         <div id="logs-error-summary" class="logs-error-summary" hidden></div>
+        <p id="logs-external-note" class="logs-note" hidden>当前由外部进程运行，实时日志在启动它的终端里；“上一轮运行”是最近一次纳管运行的归档。</p>
         <div class="logs-toolbar">
           <div class="log-tabs" aria-label="日志轮次">
             <button class="filter-chip is-active" data-log-view="current" type="button">当前运行</button>

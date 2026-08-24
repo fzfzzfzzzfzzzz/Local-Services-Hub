@@ -192,11 +192,26 @@ class RunHistoryStore:
         entry["current"] = None
         entry["expected_exit"] = None
 
+    @staticmethod
+    def _acknowledged_exits(entry: dict[str, Any]) -> dict[str, int]:
+        raw = entry.get("acknowledged_exits")
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            str(process_id): pid
+            for process_id, pid in raw.items()
+            if isinstance(process_id, str)
+            and process_id
+            and isinstance(pid, int)
+            and pid > 0
+        }
+
     def observe(
         self,
         service_id: str,
         raw_state: dict[str, Any],
         *,
+        process_id: str | None = None,
         last_error: str | None = None,
     ) -> dict[str, Any] | None:
         with self._lock:
@@ -211,7 +226,21 @@ class RunHistoryStore:
             status = str(raw_state.get("status", "")).strip().lower()
             current = entry.get("current") if isinstance(entry.get("current"), dict) else None
 
-            if last_error:
+            runtime_id = process_id or service_id
+            acknowledged = self._acknowledged_exits(entry)
+            acknowledged_pid = acknowledged.get(runtime_id)
+            if running:
+                acknowledged.pop(runtime_id, None)
+            elif pid is not None and acknowledged_pid != pid:
+                # A controller residue is only acknowledged for the exact
+                # process identity. A reused service id with a new PID must be
+                # evaluated as a new run/failure.
+                acknowledged.pop(runtime_id, None)
+                acknowledged_pid = None
+            entry["acknowledged_exits"] = acknowledged
+            entry.pop("exit_dismissed", None)
+
+            if last_error and acknowledged_pid != pid:
                 entry["last_error"] = last_error[:1000]
 
             if running:
@@ -251,9 +280,27 @@ class RunHistoryStore:
                     exit_code=exit_code,
                     last_error=last_error,
                 )
+            elif (
+                pid is not None
+                and acknowledged_pid == pid
+                and entry.get("expected_exit") in {"stop", "restart"}
+            ):
+                age = _age_seconds(raw_state)
+                stopped_at = now
+                entry["last_run"] = {
+                    "started_at": _iso(stopped_at - timedelta(seconds=age)),
+                    "stopped_at": _iso(stopped_at),
+                    "duration_seconds": round(age, 3),
+                    "exit_type": "normal_stop",
+                    "exit_code": exit_code,
+                    "pid": pid,
+                    "last_error": None,
+                }
+                entry["last_error"] = None
+                entry["expected_exit"] = None
             elif pid is not None and status not in {"", "disabled", "stopped"}:
                 previous = entry.get("last_run") if isinstance(entry.get("last_run"), dict) else {}
-                if previous.get("pid") != pid:
+                if previous.get("pid") != pid and acknowledged_pid != pid:
                     age = _age_seconds(raw_state)
                     stopped_at = now
                     started_at = stopped_at - timedelta(seconds=age)
@@ -263,15 +310,21 @@ class RunHistoryStore:
                         "launch failed",
                         "terminated",
                     }
+                    expected_stop = entry.get("expected_exit") in {"stop", "restart"}
                     entry["last_run"] = {
                         "started_at": _iso(started_at),
                         "stopped_at": _iso(stopped_at),
                         "duration_seconds": round(age, 3),
-                        "exit_type": "abnormal_exit" if abnormal else "normal_stop",
+                        "exit_type": (
+                            "normal_stop"
+                            if expected_stop or not abnormal
+                            else "abnormal_exit"
+                        ),
                         "exit_code": exit_code,
                         "pid": pid,
                         "last_error": last_error or entry.get("last_error"),
                     }
+                    entry["expected_exit"] = None
             after = json.dumps(entry, ensure_ascii=False, sort_keys=True)
             if after != before:
                 self._write()
@@ -282,6 +335,83 @@ class RunHistoryStore:
         with self._lock:
             entry = self._data.setdefault(service_id, {})
             entry["expected_exit"] = operation
+            self._write()
+
+    def get_expected_exit(self, service_id: str) -> str | None:
+        with self._lock:
+            entry = self._data.get(service_id, {})
+            value = entry.get("expected_exit") if isinstance(entry, dict) else None
+            return value if value in {"stop", "restart"} else None
+
+    def confirm_normal_stop(
+        self,
+        service_id: str,
+        pid: int | None = None,
+        *,
+        process_pids: dict[str, int] | None = None,
+    ) -> None:
+        """Correct the most recent run after a confirmed clean stop.
+
+        The controller often reports a terminated status or a non-zero exit
+        code right after a supervised stop, and concurrent snapshots can clear
+        the expected-exit flag; without this correction those stops would be
+        recorded as abnormal exits.
+        """
+        with self._lock:
+            entry = self._data.get(service_id)
+            if not isinstance(entry, dict):
+                return
+            acknowledged = self._acknowledged_exits(entry)
+            for process_id, process_pid in (process_pids or {}).items():
+                if isinstance(process_id, str) and process_id and isinstance(process_pid, int) and process_pid > 0:
+                    acknowledged[process_id] = process_pid
+            entry["acknowledged_exits"] = acknowledged
+            entry.pop("exit_dismissed", None)
+            confirmed_pids = set(acknowledged.values())
+            if isinstance(pid, int) and pid > 0:
+                confirmed_pids.add(pid)
+            last_run = entry.get("last_run")
+            if isinstance(last_run, dict):
+                if not confirmed_pids or last_run.get("pid") in confirmed_pids:
+                    last_run["exit_type"] = "normal_stop"
+                    last_run["last_error"] = None
+            current = entry.get("current")
+            if isinstance(current, dict):
+                if not confirmed_pids or current.get("pid") in confirmed_pids:
+                    self._finish_current(
+                        entry,
+                        stopped_at=_now(),
+                        exit_type="normal_stop",
+                        exit_code=0,
+                        last_error=None,
+                    )
+            entry["last_error"] = None
+            entry["expected_exit"] = None
+            self._write()
+
+    def clear_last_run(
+        self,
+        service_id: str,
+        *,
+        acknowledged_exits: dict[str, int] | None = None,
+    ) -> None:
+        """Drop the stored run history so stale exit summaries disappear.
+
+        The exit is marked as acknowledged: the controller residue for the
+        same process must not resurrect the dismissed record.
+        """
+        with self._lock:
+            entry = self._data.setdefault(service_id, {})
+            entry["last_run"] = None
+            entry["last_error"] = None
+            entry["current"] = None
+            entry["expected_exit"] = None
+            acknowledged = self._acknowledged_exits(entry)
+            for process_id, pid in (acknowledged_exits or {}).items():
+                if isinstance(process_id, str) and process_id and isinstance(pid, int) and pid > 0:
+                    acknowledged[process_id] = pid
+            entry["acknowledged_exits"] = acknowledged
+            entry.pop("exit_dismissed", None)
             self._write()
 
     def record_start_failure(self, service_id: str, error: str) -> dict[str, Any]:
@@ -300,6 +430,9 @@ class RunHistoryStore:
             entry["last_run"] = record
             entry["last_error"] = error[:1000]
             entry["current"] = None
+            entry["expected_exit"] = None
+            entry["acknowledged_exits"] = {}
+            entry.pop("exit_dismissed", None)
             self._write()
             return dict(record)
 
@@ -319,6 +452,62 @@ class RunHistoryStore:
             entry = self._data.get(service_id, {})
             last_run = entry.get("last_run") if isinstance(entry, dict) else None
             return dict(last_run) if isinstance(last_run, dict) else None
+
+    def get_acknowledged_exits(self, service_id: str) -> dict[str, int]:
+        with self._lock:
+            entry = self._data.get(service_id, {})
+            return self._acknowledged_exits(entry) if isinstance(entry, dict) else {}
+
+    def acknowledge_exits(
+        self,
+        service_id: str,
+        process_pids: dict[str, int],
+    ) -> dict[str, int]:
+        with self._lock:
+            entry = self._data.setdefault(service_id, {})
+            acknowledged = self._acknowledged_exits(entry)
+            before = dict(acknowledged)
+            acknowledged.update(
+                {
+                    process_id: pid
+                    for process_id, pid in process_pids.items()
+                    if isinstance(process_id, str)
+                    and process_id
+                    and isinstance(pid, int)
+                    and pid > 0
+                }
+            )
+            if acknowledged != before:
+                entry["acknowledged_exits"] = acknowledged
+                entry.pop("exit_dismissed", None)
+                self._write()
+            return acknowledged
+
+    def reconcile_acknowledged_exits(
+        self,
+        service_id: str,
+        process_states: dict[str, dict[str, Any]],
+    ) -> dict[str, int]:
+        """Forget acknowledgements as soon as a new run is observable."""
+        with self._lock:
+            entry = self._data.get(service_id)
+            if not isinstance(entry, dict):
+                return {}
+            acknowledged = self._acknowledged_exits(entry)
+            before = dict(acknowledged)
+            for process_id, acknowledged_pid in tuple(acknowledged.items()):
+                raw_state = process_states.get(process_id) or {}
+                raw_pid = raw_state.get("pid")
+                if bool(raw_state.get("is_running", False)) or (
+                    isinstance(raw_pid, int)
+                    and raw_pid > 0
+                    and raw_pid != acknowledged_pid
+                ):
+                    acknowledged.pop(process_id, None)
+            if acknowledged != before:
+                entry["acknowledged_exits"] = acknowledged
+                self._write()
+            return acknowledged
 
     def remove_service(self, service_id: str) -> None:
         with self._lock:

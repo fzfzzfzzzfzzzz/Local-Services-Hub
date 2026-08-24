@@ -40,6 +40,26 @@ class StatusResolver:
     async def close(self) -> None:
         await self._health.aclose()
 
+    @staticmethod
+    def _without_acknowledged_exit(
+        raw_state: dict[str, Any] | None,
+        acknowledged_pid: int | None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(raw_state, dict) or not isinstance(acknowledged_pid, int):
+            return raw_state
+        pid = raw_state.get("pid")
+        if bool(raw_state.get("is_running", False)) or pid != acknowledged_pid:
+            return raw_state
+        normalized = dict(raw_state)
+        normalized.update(
+            status="Stopped",
+            is_running=False,
+            pid=0,
+            exit_code=0,
+            launch_error=None,
+        )
+        return normalized
+
     async def _http_health(
         self,
         url: str,
@@ -193,6 +213,10 @@ class StatusResolver:
             view["health_check"].update(status="checking", detail="进程正在启动")
             return view
 
+        # A PID on a non-running controller entry belongs to the previous run.
+        # It is retained by RunHistoryStore, not exposed as a current PID.
+        view["pid"] = None
+
         listening_port = None
         if active_config is not None and is_port_listening(active_config.port):
             listening_port = active_config.port
@@ -288,6 +312,7 @@ class StatusResolver:
             view["state"] = "Starting"
             view["health_check"].update(status="checking", detail="进程正在启动")
             return view
+        view["pid"] = None
         if is_port_listening(item.port):
             view["state"] = "External Running"
             view["health_check"].update(
@@ -318,10 +343,16 @@ class StatusResolver:
         raw_states: dict[str, dict[str, Any]],
         *,
         controller_online: bool,
+        acknowledged_exits: dict[str, int] | None = None,
     ) -> dict[str, Any]:
+        acknowledged_exits = acknowledged_exits or {}
+        primary_process_id = process_id_for(service.id)
         primary = await self.resolve_one(
             service,
-            raw_states.get(process_id_for(service.id)),
+            self._without_acknowledged_exit(
+                raw_states.get(primary_process_id),
+                acknowledged_exits.get(primary_process_id),
+            ),
             controller_online=controller_online,
         )
         active_items = service.active_config.items() if service.active_config else ()
@@ -350,7 +381,10 @@ class StatusResolver:
                         self._resolve_additional_runtime(
                             service,
                             item,
-                            raw_states.get(process_id_for(service.id, item.id)),
+                            self._without_acknowledged_exit(
+                                raw_states.get(process_id_for(service.id, item.id)),
+                                acknowledged_exits.get(process_id_for(service.id, item.id)),
+                            ),
                             controller_online=controller_online,
                         )
                         for item in effective_items[1:]
@@ -369,6 +403,7 @@ class StatusResolver:
 
         states = [str(item["state"]) for item in runtime_views]
         passing = sum(state in {"Healthy", "Managed Running", "External Running"} for state in states)
+        external = sum(state == "External Running" for state in states)
         errors = [
             f":{item['port']} {item['error']}"
             for item in runtime_views
@@ -378,6 +413,9 @@ class StatusResolver:
             overall = "Disabled"
         elif "Unknown" in states:
             overall = "Unknown"
+        elif external and external != len(states):
+            overall = "Mixed Running"
+            errors.append("运行项来源不一致，需要统一纳入管理")
         elif "Error" in states:
             overall = "Unhealthy" if passing or "Starting" in states else "Error"
         elif "Unhealthy" in states:
@@ -398,7 +436,7 @@ class StatusResolver:
             health_status = "passing"
         elif overall == "Starting":
             health_status = "checking"
-        elif overall in {"Error", "Unhealthy"}:
+        elif overall in {"Error", "Unhealthy", "Mixed Running"}:
             health_status = "failing"
         elif overall in {"Stopped", "Disabled"}:
             health_status = "inactive"
@@ -421,14 +459,17 @@ class StatusResolver:
         raw_states: dict[str, dict[str, Any]],
         *,
         controller_online: bool,
+        acknowledged_exits_by_service: dict[str, dict[str, int]] | None = None,
     ) -> list[dict[str, Any]]:
         service_list = list(services)
+        acknowledged_exits_by_service = acknowledged_exits_by_service or {}
         resolved = await asyncio.gather(
             *(
                 self.resolve_service(
                     service,
                     raw_states,
                     controller_online=controller_online,
+                    acknowledged_exits=acknowledged_exits_by_service.get(service.id),
                 )
                 for service in service_list
             )
@@ -438,6 +479,7 @@ class StatusResolver:
             "Managed Running": 0,
             "Starting": 0,
             "External Running": 1,
+            "Mixed Running": 2,
             "Unhealthy": 2,
             "Error": 2,
             "Stopped": 3,
